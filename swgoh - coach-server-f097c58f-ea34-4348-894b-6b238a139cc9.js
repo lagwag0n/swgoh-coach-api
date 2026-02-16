@@ -1,15 +1,6 @@
 // ============================================================
 //  SWGOH AI COACH - Backend Server (Node.js + Express + OpenAI)
 // ============================================================
-//
-// SETUP:
-//   1. mkdir swgoh-coach-api && cd swgoh-coach-api
-//   2. npm init -y
-//   3. npm install express cors openai dotenv
-//   4. Create .env file with: OPENAI_API_KEY=sk-your-key-here
-//   5. node server.js
-//   6. Update CONFIG.API_URL in swgoh-coach.html to http://localhost:3000/api/chat
-//
 
 const express = require('express');
 const cors = require('cors');
@@ -54,8 +45,8 @@ const SYSTEM_PROMPT = [
 
 // ===== RATE LIMITING =====
 const rateLimitMap = new Map();
-const RATE_LIMIT_WINDOW = 60000; // 1 minute
-const RATE_LIMIT_MAX = 20; // 20 requests per minute per IP
+const RATE_LIMIT_WINDOW = 60000;
+const RATE_LIMIT_MAX = 20;
 
 function checkRateLimit(ip) {
   const now = Date.now();
@@ -67,14 +58,13 @@ function checkRateLimit(ip) {
   return true;
 }
 
-// Clean up rate limit map periodically
 setInterval(function() {
   var now = Date.now();
   rateLimitMap.forEach(function(ts, ip) {
     while (ts.length && ts[0] < now - RATE_LIMIT_WINDOW) ts.shift();
     if (ts.length === 0) rateLimitMap.delete(ip);
   });
-}, 300000); // Every 5 minutes
+}, 300000);
 
 // ===== INPUT VALIDATION =====
 function sanitizeString(str, maxLen) {
@@ -90,7 +80,6 @@ function validateAllyCode(code) {
 // ===== CHAT ENDPOINT =====
 app.post('/api/chat', async function(req, res) {
   try {
-    // Rate limiting
     var clientIp = req.ip || req.connection.remoteAddress || 'unknown';
     if (!checkRateLimit(clientIp)) {
       return res.status(429).json({ error: 'Too many requests. Please wait.' });
@@ -101,7 +90,6 @@ app.post('/api/chat', async function(req, res) {
     var history = req.body.history;
     var allyCode = req.body.ally_code;
 
-    // Validate inputs
     if (!message || typeof message !== "string" || message.trim().length === 0) {
       return res.status(400).json({ error: 'Invalid message' });
     }
@@ -112,10 +100,8 @@ app.post('/api/chat', async function(req, res) {
     message = sanitizeString(message, 2000);
     rosterSummary = sanitizeString(rosterSummary || "", 10000);
 
-    // Build messages array
     var messages = [{ role: "system", content: SYSTEM_PROMPT }];
 
-    // Add roster context as system message
     if (rosterSummary) {
       messages.push({
         role: "system",
@@ -123,7 +109,6 @@ app.post('/api/chat', async function(req, res) {
       });
     }
 
-    // Add conversation history (limited to last 16 messages)
     if (Array.isArray(history)) {
       var recent = history.slice(-16);
       recent.forEach(function(h) {
@@ -138,10 +123,8 @@ app.post('/api/chat', async function(req, res) {
       });
     }
 
-    // Add current message (already wrapped by client)
     messages.push({ role: "user", content: message });
 
-    // Call OpenAI
     var completion = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || 'gpt-4o',
       messages: messages,
@@ -154,8 +137,6 @@ app.post('/api/chat', async function(req, res) {
 
   } catch (err) {
     console.error('Chat error:', err.message);
-
-    // Do not leak internal errors to client
     if (err.status === 429) {
       return res.status(429).json({ error: 'AI rate limit reached. Please wait a moment.' });
     }
@@ -173,3 +154,4 @@ var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
   console.log('SWGoH Coach API running on port ' + PORT);
 });
+
