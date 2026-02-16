@@ -77,6 +77,48 @@ function validateAllyCode(code) {
   return /^[0-9]{9}$/.test(code.replace(/[^0-9]/g, ""));
 }
 
+// ===== PLAYER DATA ENDPOINT =====
+// Proxies swgoh.gg so the frontend never hits it directly (avoids CORS issues)
+app.get('/api/player/:code', async function(req, res) {
+  try {
+    var clientIp = req.ip || req.connection.remoteAddress || 'unknown';
+    if (!checkRateLimit(clientIp)) {
+      return res.status(429).json({ error: 'Too many requests. Please wait.' });
+    }
+
+    var code = req.params.code.replace(/[^0-9]/g, '');
+    if (!validateAllyCode(code)) {
+      return res.status(400).json({ error: 'Invalid ally code format.' });
+    }
+
+    // Use native fetch (Node 18+) to call swgoh.gg
+    var swgohRes = await fetch(`https://swgoh.gg/api/player/${code}/`, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'SWGoH-Coach-Bot/1.0'
+      },
+      signal: AbortSignal.timeout(10000) // 10s timeout
+    });
+
+    if (swgohRes.status === 404) {
+      return res.status(404).json({ error: 'Ally code not found. Check the code and try again.' });
+    }
+    if (!swgohRes.ok) {
+      return res.status(502).json({ error: `swgoh.gg returned ${swgohRes.status}` });
+    }
+
+    var data = await swgohRes.json();
+    res.json(data);
+
+  } catch (err) {
+    console.error('Player fetch error:', err.message);
+    if (err.name === 'TimeoutError') {
+      return res.status(504).json({ error: 'Request timed out. Try again.' });
+    }
+    res.status(500).json({ error: 'Failed to fetch player data.' });
+  }
+});
+
 // ===== CHAT ENDPOINT =====
 app.post('/api/chat', async function(req, res) {
   try {
@@ -123,7 +165,10 @@ app.post('/api/chat', async function(req, res) {
       });
     }
 
-    messages.push({ role: "user", content: message });
+    messages.push({
+      role: "user",
+      content: "<<<USER_INPUT>>>\n" + message + "\n<<<END_USER_INPUT>>>"
+    });
 
     var completion = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || 'gpt-4o',
@@ -154,4 +199,3 @@ var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
   console.log('SWGoH Coach API running on port ' + PORT);
 });
-
