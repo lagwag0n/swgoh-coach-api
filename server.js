@@ -78,7 +78,7 @@ function validateAllyCode(code) {
 }
 
 // ===== PLAYER DATA ENDPOINT =====
-// Proxies swgoh.gg so the frontend never hits it directly (avoids CORS issues)
+// Proxies all three swgoh.gg endpoints and bundles into one response
 app.get('/api/player/:code', async function(req, res) {
   try {
     var clientIp = req.ip || req.connection.remoteAddress || 'unknown';
@@ -91,24 +91,47 @@ app.get('/api/player/:code', async function(req, res) {
       return res.status(400).json({ error: 'Invalid ally code format.' });
     }
 
-    // Use native fetch (Node 18+) to call swgoh.gg
-    var swgohRes = await fetch(`https://swgoh.gg/api/player/${code}/`, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'SWGoH-Coach-Bot/1.0'
-      },
-      signal: AbortSignal.timeout(10000) // 10s timeout
-    });
+    // Browser-like headers to avoid bot detection
+    var swgohHeaders = {
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      'Referer': 'https://swgoh.gg/',
+      'Origin': 'https://swgoh.gg'
+    };
 
-    if (swgohRes.status === 404) {
-      return res.status(404).json({ error: 'Ally code not found. Check the code and try again.' });
-    }
-    if (!swgohRes.ok) {
-      return res.status(502).json({ error: `swgoh.gg returned ${swgohRes.status}` });
+    var opts = { headers: swgohHeaders, signal: AbortSignal.timeout(15000) };
+
+    // Fetch player stats + characters + ships in parallel
+    var results = await Promise.allSettled([
+      fetch(`https://swgoh.gg/api/player/${code}/`,            opts),
+      fetch(`https://swgoh.gg/api/player/${code}/characters/`, opts),
+      fetch(`https://swgoh.gg/api/player/${code}/ships/`,      opts),
+    ]);
+
+    var playerRes = results[0];
+    if (playerRes.status === 'rejected' || !playerRes.value.ok) {
+      var status = playerRes.value?.status;
+      if (status === 404) return res.status(404).json({ error: 'Ally code not found.' });
+      return res.status(502).json({ error: `swgoh.gg error (${status || 'network'})` });
     }
 
-    var data = await swgohRes.json();
-    res.json(data);
+    var playerData = await playerRes.value.json();
+
+    var chars = [], ships = [];
+    if (results[1].status === 'fulfilled' && results[1].value.ok) {
+      var charsJson = await results[1].value.json();
+      chars = Array.isArray(charsJson) ? charsJson : (charsJson.results || []);
+    }
+    if (results[2].status === 'fulfilled' && results[2].value.ok) {
+      var shipsJson = await results[2].value.json();
+      ships = Array.isArray(shipsJson) ? shipsJson : (shipsJson.results || []);
+    }
+
+    playerData.characters = chars;
+    playerData.ships = ships;
+
+    res.json(playerData);
 
   } catch (err) {
     console.error('Player fetch error:', err.message);
