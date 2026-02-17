@@ -282,6 +282,15 @@ app.get('/api/player/:code', async function(req, res) {
 
     var raw = await playerRes.json();
     console.log('[SWGoH] Comlink response — name:', raw.name, 'units:', (raw.rosterUnit || []).length);
+    console.log('[SWGoH] Raw top-level keys:', Object.keys(raw).join(', '));
+    
+    // Log any field that might contain currency/resource data
+    Object.keys(raw).forEach(function(key) {
+      var val = raw[key];
+      if (Array.isArray(val) && val.length > 0 && val.length < 50 && key !== 'rosterUnit' && key !== 'profileStat') {
+        console.log('[SWGoH] Field "' + key + '" (' + val.length + ' items), sample:', JSON.stringify(val[0]).slice(0, 200));
+      }
+    });
 
     // ===== TRANSFORM comlink → frontend format =====
     var rosterUnits = raw.rosterUnit || [];
@@ -382,27 +391,44 @@ app.get('/api/player/:code', async function(req, res) {
       if (tab === 2) response.fleet_arena.rank = pvp.rank || null;
     });
 
-    // Extract currencies
+    // Extract currencies — try multiple possible field names
     var currencies = {};
-    (raw.currency || []).forEach(function(c) {
-      var id = (c.id || c.currencyId || '').toString().toUpperCase();
-      var qty = parseInt(c.quantity || c.value || 0);
+    var currencyArray = raw.currency || raw.currencyItem || raw.profileCurrency || [];
+    
+    // If not found as array, search all fields for currency-like data
+    if (!Array.isArray(currencyArray) || currencyArray.length === 0) {
+      Object.keys(raw).forEach(function(key) {
+        if (key.toLowerCase().indexOf('currenc') >= 0 || key.toLowerCase().indexOf('resource') >= 0) {
+          var val = raw[key];
+          if (Array.isArray(val)) currencyArray = val;
+          else if (typeof val === 'object' && val !== null) currencyArray = [val];
+        }
+      });
+    }
+
+    console.log('[SWGoH] Currency array length:', (currencyArray || []).length);
+    if (currencyArray.length > 0) {
+      console.log('[SWGoH] Currency sample:', JSON.stringify(currencyArray.slice(0, 3)));
+    }
+
+    (currencyArray || []).forEach(function(c) {
+      var id = String(c.id || c.currencyId || c.key || '').toUpperCase();
+      var qty = parseInt(c.quantity || c.value || c.amount || 0);
       // Map known currency IDs
       if (id === '1' || id.indexOf('CREDIT') >= 0) currencies.credits = qty;
-      if (id === '2' || id.indexOf('CRYSTAL') >= 0) currencies.crystals = qty;
-      if (id === '3' || id.indexOf('ALLY_POINT') >= 0 || id.indexOf('ALLYPOINT') >= 0) currencies.ally_points = qty;
+      if (id === '2' || id.indexOf('CRYSTAL') >= 0 || id.indexOf('PREMIUM') >= 0) currencies.crystals = qty;
+      if (id === '3' || id.indexOf('ALLY') >= 0) currencies.ally_points = qty;
       if (id === '4' || id.indexOf('CANTINA') >= 0) currencies.cantina = qty;
-      if (id === '5' || id.indexOf('SQUAD_ARENA') >= 0) currencies.squad_arena_tokens = qty;
-      if (id === '6' || id.indexOf('FLEET_ARENA') >= 0 || id.indexOf('SHIP_PRESTIGE') >= 0) currencies.fleet_tokens = qty;
-      if (id === '7' || id.indexOf('GALACTIC_WAR') >= 0) currencies.gw_tokens = qty;
+      if (id === '5' || id.indexOf('SQUAD') >= 0) currencies.squad_arena_tokens = qty;
+      if (id === '6' || id.indexOf('FLEET') >= 0 || id.indexOf('SHIP_PRESTIGE') >= 0) currencies.fleet_tokens = qty;
+      if (id === '7' || id.indexOf('GALACTIC_WAR') >= 0 || id.indexOf('GW') >= 0) currencies.gw_tokens = qty;
       if (id === '15' || id.indexOf('GUILD_EVENT_TOKEN_1') >= 0 || id === 'GET1') currencies.get1 = qty;
       if (id === '16' || id.indexOf('GUILD_EVENT_TOKEN_2') >= 0 || id === 'GET2') currencies.get2 = qty;
       if (id === '17' || id.indexOf('GUILD_EVENT_TOKEN_3') >= 0 || id === 'GET3') currencies.get3 = qty;
     });
     response.currencies = currencies;
 
-    // Log raw currency data for debugging
-    console.log('[SWGoH] Raw currency keys:', (raw.currency || []).map(function(c) { return (c.id || c.currencyId || '?') + '=' + (c.quantity || c.value || 0); }).join(', '));
+    console.log('[SWGoH] Parsed currencies:', JSON.stringify(currencies));
 
     res.json(response);
 
