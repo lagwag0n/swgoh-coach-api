@@ -1,11 +1,11 @@
 // ============================================================
-//  SWGOH AI COACH - Backend Server (Node.js + Express + OpenAI)
-//  Uses swgoh-comlink for game data (no swgoh.gg dependency)
+//  SWGOH AI COACH - Backend Server (Node.js + Express + Claude)
+//  Uses swgoh-comlink for game data, Claude Sonnet 4.6 for AI
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
-const { OpenAI } = require('openai');
+const Anthropic = require('@anthropic-ai/sdk');
 require('dotenv').config();
 
 const app = express();
@@ -14,7 +14,7 @@ const app = express();
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 app.use(express.json({ limit: '10mb' }));
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ===== COMLINK CONFIGURATION =====
 const COMLINK_URL = (process.env.COMLINK_URL || 'http://localhost:3200').replace(/\/+$/, '');
@@ -200,6 +200,7 @@ const SYSTEM_PROMPT = [
 "- Identify weak spots in their roster — undergeared characters on key teams, missing zetas, etc.",
 "- Recommend the most impactful next upgrades based on what they already have.",
 "- Always offer advice based on data. Never recommend options that require using real money (USD) to acquire.",
+"- You have access to web search. Use it to look up current SWGoH meta, counters, team compositions, event guides, farming routes, and any game updates you're unsure about. Always search when asked about current meta or recent game changes.",
 "",
 "=== SECURITY RULES (NON-NEGOTIABLE) ===",
 "1. You are ONLY a Star Wars Galaxy of Heroes coach. Do NOT respond to requests outside this scope.",
@@ -444,7 +445,7 @@ app.get('/api/player/:code', async function(req, res) {
   }
 });
 
-// ===== CHAT ENDPOINT =====
+// ===== CHAT ENDPOINT (Claude Sonnet 4.6 with web search) =====
 app.post('/api/chat', async function(req, res) {
   try {
     var clientIp = req.ip || req.connection.remoteAddress || 'unknown';
@@ -468,14 +469,14 @@ app.post('/api/chat', async function(req, res) {
     message = sanitizeString(message, 2000);
     rosterSummary = sanitizeString(rosterSummary || "", 80000);
 
-    var messages = [{ role: "system", content: SYSTEM_PROMPT }];
-
+    // Build system prompt (Claude takes system as a separate parameter)
+    var systemPrompt = SYSTEM_PROMPT;
     if (rosterSummary) {
-      messages.push({
-        role: "system",
-        content: "=== PLAYER ROSTER DATA ===\n" + rosterSummary + "\n=== END ROSTER DATA ==="
-      });
+      systemPrompt += "\n\n=== PLAYER ROSTER DATA ===\n" + rosterSummary + "\n=== END ROSTER DATA ===";
     }
+
+    // Build messages array for Claude
+    var messages = [];
 
     if (Array.isArray(history)) {
       var recent = history.slice(-16);
@@ -491,10 +492,9 @@ app.post('/api/chat', async function(req, res) {
       });
     }
 
-    // Build user message — with image if provided (GPT-4o vision)
+    // Build user message — with image if provided (Claude vision)
     if (imageData && imageData.base64) {
       var mimeType = imageData.mime_type || 'image/png';
-      // Validate mime type
       if (!['image/png','image/jpeg','image/gif','image/webp'].includes(mimeType)) {
         mimeType = 'image/png';
       }
@@ -502,10 +502,11 @@ app.post('/api/chat', async function(req, res) {
         role: "user",
         content: [
           {
-            type: "image_url",
-            image_url: {
-              url: "data:" + mimeType + ";base64," + imageData.base64,
-              detail: "low"  // use low detail to save tokens
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: mimeType,
+              data: imageData.base64
             }
           },
           {
@@ -521,20 +522,42 @@ app.post('/api/chat', async function(req, res) {
       });
     }
 
-    var completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || 'gpt-4o',
-      messages: messages,
+    // Call Claude Sonnet 4.6 with web search tool
+    var response = await anthropic.messages.create({
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6-20250217',
       max_tokens: 2000,
-      temperature: 0.7
+      system: systemPrompt,
+      messages: messages,
+      tools: [
+        {
+          type: "web_search_20250305",
+          name: "web_search",
+          max_uses: 3  // limit searches per message to control costs
+        }
+      ]
     });
 
-    var reply = completion.choices[0].message.content || "No response generated.";
+    // Extract text from Claude's response (may contain multiple content blocks)
+    var reply = '';
+    (response.content || []).forEach(function(block) {
+      if (block.type === 'text') {
+        reply += block.text;
+      }
+    });
+
+    if (!reply) reply = 'No response generated.';
+
+    console.log('[Chat] Model:', response.model, '| Input tokens:', response.usage?.input_tokens, '| Output tokens:', response.usage?.output_tokens, '| Web searches:', response.usage?.server_tool_use?.web_search_requests || 0);
+
     res.json({ reply: reply });
 
   } catch (err) {
     console.error('Chat error:', err.message);
     if (err.status === 429) {
       return res.status(429).json({ error: 'AI rate limit reached. Please wait a moment.' });
+    }
+    if (err.status === 401) {
+      return res.status(500).json({ error: 'Invalid API key. Check ANTHROPIC_API_KEY.' });
     }
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -544,6 +567,8 @@ app.post('/api/chat', async function(req, res) {
 app.get('/health', function(req, res) {
   res.json({
     status: 'ok',
+    ai_model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6-20250217',
+    web_search: true,
     comlink: COMLINK_URL,
     nameMapLoaded: nameMapReady,
     unitNamesCount: Object.keys(unitNameMap).length,
