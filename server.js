@@ -12,7 +12,7 @@ const app = express();
 
 // SECURITY: Restrict CORS to your domain in production
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
-app.use(express.json({ limit: '500kb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -408,6 +408,7 @@ app.post('/api/chat', async function(req, res) {
     var rosterSummary = req.body.roster_summary;
     var history = req.body.history;
     var allyCode = req.body.ally_code;
+    var imageData = req.body.image; // { base64, mime_type }
 
     if (!message || typeof message !== "string" || message.trim().length === 0) {
       return res.status(400).json({ error: 'Invalid message' });
@@ -442,10 +443,35 @@ app.post('/api/chat', async function(req, res) {
       });
     }
 
-    messages.push({
-      role: "user",
-      content: "<<<USER_INPUT>>>\n" + message + "\n<<<END_USER_INPUT>>>"
-    });
+    // Build user message — with image if provided (GPT-4o vision)
+    if (imageData && imageData.base64) {
+      var mimeType = imageData.mime_type || 'image/png';
+      // Validate mime type
+      if (!['image/png','image/jpeg','image/gif','image/webp'].includes(mimeType)) {
+        mimeType = 'image/png';
+      }
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: {
+              url: "data:" + mimeType + ";base64," + imageData.base64,
+              detail: "low"  // use low detail to save tokens
+            }
+          },
+          {
+            type: "text",
+            text: "<<<USER_INPUT>>>\n" + message + "\n<<<END_USER_INPUT>>>"
+          }
+        ]
+      });
+    } else {
+      messages.push({
+        role: "user",
+        content: "<<<USER_INPUT>>>\n" + message + "\n<<<END_USER_INPUT>>>"
+      });
+    }
 
     var completion = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || 'gpt-4o',
