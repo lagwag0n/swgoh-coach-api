@@ -71,22 +71,96 @@ async function loadUnitNames() {
     var locData = await locRes.json();
 
     // Step 3: Build name map from localization entries
-    // Keys look like: "UNIT_JEDIKNIGHTREVAN_NAME" = "Jedi Knight Revan"
     var count = 0;
     var locEntries = locData;
+    var sampleKeys = [];
 
-    // Handle possible nested formats
+    // Handle possible nested formats — comlink may nest under various keys
     if (locData.ENG_US) locEntries = locData.ENG_US;
     if (locData.data) locEntries = locData.data;
-
-    Object.keys(locEntries).forEach(function(key) {
+    
+    // Sometimes the localization comes back as { "Loc_ENG_US.txt": { ... } }
+    var topKeys = Object.keys(locEntries);
+    console.log('[SWGoH] Localization top-level keys (first 5):', topKeys.slice(0, 5));
+    console.log('[SWGoH] Localization top-level key count:', topKeys.length);
+    
+    // If there's only one top-level key and its value is an object, unwrap it
+    if (topKeys.length <= 3 && typeof locEntries[topKeys[0]] === 'object' && locEntries[topKeys[0]] !== null) {
+      console.log('[SWGoH] Unwrapping nested localization from key:', topKeys[0]);
+      locEntries = locEntries[topKeys[0]];
+    }
+    
+    // If the value is a giant string (text blob format: "KEY|VALUE\nKEY|VALUE\n...")
+    // Parse it into key-value pairs
+    var firstVal = locEntries[Object.keys(locEntries)[0]];
+    if (typeof firstVal === 'string' && firstVal.length > 1000) {
+      console.log('[SWGoH] Detected text-blob localization format, parsing...');
+      var parsed = {};
+      firstVal.split('\n').forEach(function(line) {
+        // Format is typically: KEY|Value text here
+        var pipeIdx = line.indexOf('|');
+        if (pipeIdx > 0) {
+          var k = line.substring(0, pipeIdx).trim();
+          var v = line.substring(pipeIdx + 1).trim();
+          if (k && v) parsed[k] = v;
+        }
+        // Also handle KEY=Value format
+        var eqIdx = line.indexOf('=');
+        if (pipeIdx < 0 && eqIdx > 0) {
+          var k2 = line.substring(0, eqIdx).trim();
+          var v2 = line.substring(eqIdx + 1).trim();
+          if (k2 && v2) parsed[k2] = v2;
+        }
+      });
+      console.log('[SWGoH] Parsed', Object.keys(parsed).length, 'entries from text blob');
+      if (Object.keys(parsed).length > 100) {
+        locEntries = parsed;
+      }
+    }
+    
+    // Collect sample keys that contain "UNIT" to understand the format
+    var allKeys = Object.keys(locEntries);
+    console.log('[SWGoH] Total localization entries:', allKeys.length);
+    
+    var unitKeys = allKeys.filter(function(k) { return k.indexOf('UNIT') >= 0 && k.indexOf('NAME') >= 0; });
+    console.log('[SWGoH] Keys containing UNIT+NAME (first 10):', unitKeys.slice(0, 10));
+    
+    // Try multiple regex patterns to match unit names
+    allKeys.forEach(function(key) {
+      var val = locEntries[key];
+      if (typeof val !== 'string') return;
+      
+      // Pattern 1: UNIT_XXXX_NAME or UNIT_XXXX_NAME_V2
       var match = key.match(/^UNIT_(.+?)_NAME(?:_V\d+)?$/);
-      if (match) {
-        var baseId = match[1];
-        unitNameMap[baseId] = locEntries[key];
+      // Pattern 2: Some localization uses just the base_id as key with _NAME suffix
+      if (!match) match = key.match(/^(.+?)_NAME(?:_V\d+)?$/);
+      
+      if (match && key.indexOf('UNIT') >= 0) {
+        var baseId = match[1].replace(/^UNIT_/, '');
+        unitNameMap[baseId] = val;
         count++;
       }
     });
+    
+    // If still no matches, try a broader approach: look for any key ending in _NAME
+    // where the value looks like a unit name (short, title-cased)
+    if (count === 0) {
+      console.log('[SWGoH] Primary patterns found 0 matches, trying broader search...');
+      allKeys.forEach(function(key) {
+        var val = locEntries[key];
+        if (typeof val !== 'string') return;
+        if (key.indexOf('_NAME') < 0) return;
+        if (val.length > 50 || val.length < 2) return; // skip descriptions
+        
+        // Extract the base portion before _NAME
+        var basePart = key.replace(/_NAME(?:_V\d+)?$/, '');
+        if (basePart && basePart !== key) {
+          unitNameMap[basePart] = val;
+          count++;
+        }
+      });
+      console.log('[SWGoH] Broader search found', count, 'name entries');
+    }
 
     nameMapReady = true;
     console.log('[SWGoH] Loaded', count, 'unit names.');
@@ -400,6 +474,30 @@ app.get('/health', function(req, res) {
     nameMapLoaded: nameMapReady,
     unitNamesCount: Object.keys(unitNameMap).length,
     timestamp: new Date().toISOString()
+  });
+});
+
+// ===== DEBUG: Check name map samples =====
+app.get('/debug-names', function(req, res) {
+  var allNames = Object.keys(unitNameMap);
+  var samples = {};
+  // Show first 20 entries
+  allNames.slice(0, 20).forEach(function(key) {
+    samples[key] = unitNameMap[key];
+  });
+  // Also check some known IDs
+  var knownIds = ['JEDIKNIGHTREVAN','GRANDADMIRALTHRAWN','GLREY','JEDIMASTERKENOBI',
+                  'DARTHREVAN','COMMANDERLUKESKYWALKER','PADMEAMIDALA','EMPERORPALPATINE'];
+  var knownResults = {};
+  knownIds.forEach(function(id) {
+    knownResults[id] = unitNameMap[id] || '(not found)';
+  });
+  res.json({
+    totalNames: allNames.length,
+    nameMapReady: nameMapReady,
+    first20: samples,
+    knownUnits: knownResults,
+    sampleKeys: allNames.slice(0, 50)
   });
 });
 
