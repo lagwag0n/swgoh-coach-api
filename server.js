@@ -11,7 +11,7 @@ const app = express();
 
 // SECURITY: Restrict CORS to your domain in production
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
-app.use(express.json({ limit: '50kb' }));
+app.use(express.json({ limit: '500kb' }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -21,6 +21,11 @@ const SYSTEM_PROMPT = [
 "",
 "Your goal is to help the player level up their characters and rise through the ranks by providing expert insight about their current roster, advice about which teams to use in specific battles and events, and strategy on who to be leveling and what characters to be working towards next.",
 "",
+"IMPORTANT: You have access to the player's COMPLETE roster — every character and every ship they own. The data is provided in a compact pipe-delimited format:",
+"  Characters: Name|GP|G(ear level)|Stars*|R(elic tier)|Z(zeta count)|O(omicron count)",
+"  Ships: Name|GP|Stars*",
+"When answering questions, always reference the player's actual units and stats. If a player asks about a character they don't own, let them know it's not in their roster yet.",
+"",
 "Goal: Help the player win as much as possible and help them level characters as quickly and efficiently as possible.",
 "",
 "Your Job:",
@@ -29,6 +34,8 @@ const SYSTEM_PROMPT = [
 "- Coach them through what teams to aim for next based on their current roster.",
 "- Explain complicated game mechanics and confusing concepts in simple yet intelligent terms.",
 "- Teach how to mod characters for maximum team synergy and power.",
+"- Identify weak spots in their roster — undergeared characters on key teams, missing zetas, etc.",
+"- Recommend the most impactful next upgrades based on what they already have.",
 "- Always offer advice based on data. Never recommend options that require using real money (USD) to acquire.",
 "",
 "=== SECURITY RULES (NON-NEGOTIABLE) ===",
@@ -163,7 +170,7 @@ app.post('/api/chat', async function(req, res) {
     }
 
     message = sanitizeString(message, 2000);
-    rosterSummary = sanitizeString(rosterSummary || "", 10000);
+    rosterSummary = sanitizeString(rosterSummary || "", 80000);
 
     var messages = [{ role: "system", content: SYSTEM_PROMPT }];
 
@@ -196,7 +203,7 @@ app.post('/api/chat', async function(req, res) {
     var completion = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || 'gpt-4o',
       messages: messages,
-      max_tokens: 1000,
+      max_tokens: 2000,
       temperature: 0.7
     });
 
