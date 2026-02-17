@@ -1,5 +1,6 @@
 // ============================================================
 //  SWGOH AI COACH - Backend Server (Node.js + Express + OpenAI)
+//  Uses swgoh-comlink for game data (no swgoh.gg dependency)
 // ============================================================
 
 const express = require('express');
@@ -15,15 +16,103 @@ app.use(express.json({ limit: '500kb' }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ===== SYSTEM PROMPT WITH SECURITY HARDENING =====
+// ===== COMLINK CONFIGURATION =====
+const COMLINK_URL = (process.env.COMLINK_URL || 'http://localhost:3200').replace(/\/+$/, '');
+
+// ===== UNIT NAME MAP (loaded from comlink localization on startup) =====
+var unitNameMap = {};   // { "JEDIKNIGHTREVAN": "Jedi Knight Revan", ... }
+var nameMapReady = false;
+
+// Fallback: convert raw ID to readable name
+function cleanUnitId(id) {
+  if (!id) return 'Unknown';
+  return id
+    .replace(/_/g, ' ')
+    .toLowerCase()
+    .replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+}
+
+function getUnitName(definitionId) {
+  // definitionId comes as "BASEUNITID:SEVEN_STAR" — strip the rarity suffix
+  var baseId = (definitionId || '').split(':')[0];
+  if (unitNameMap[baseId]) return unitNameMap[baseId];
+  return cleanUnitId(baseId);
+}
+
+// ===== LOAD LOCALIZATION FROM COMLINK =====
+async function loadUnitNames() {
+  try {
+    console.log('[SWGoH] Loading unit names from comlink at', COMLINK_URL);
+
+    // Step 1: Get metadata to find latest localization version
+    var metaRes = await fetch(COMLINK_URL + '/metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: {} }),
+      signal: AbortSignal.timeout(15000)
+    });
+    if (!metaRes.ok) throw new Error('Metadata fetch failed: ' + metaRes.status);
+    var meta = await metaRes.json();
+    var locVersion = meta.latestLocalizationBundleVersion;
+    if (!locVersion) throw new Error('No localization version in metadata');
+    console.log('[SWGoH] Localization version:', locVersion);
+
+    // Step 2: Fetch English localization bundle
+    var locRes = await fetch(COMLINK_URL + '/localization', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payload: { id: locVersion + ':ENG_US' },
+        unzip: true
+      }),
+      signal: AbortSignal.timeout(30000)
+    });
+    if (!locRes.ok) throw new Error('Localization fetch failed: ' + locRes.status);
+    var locData = await locRes.json();
+
+    // Step 3: Build name map from localization entries
+    // Keys look like: "UNIT_JEDIKNIGHTREVAN_NAME" = "Jedi Knight Revan"
+    var count = 0;
+    var locEntries = locData;
+
+    // Handle possible nested formats
+    if (locData.ENG_US) locEntries = locData.ENG_US;
+    if (locData.data) locEntries = locData.data;
+
+    Object.keys(locEntries).forEach(function(key) {
+      var match = key.match(/^UNIT_(.+?)_NAME(?:_V\d+)?$/);
+      if (match) {
+        var baseId = match[1];
+        unitNameMap[baseId] = locEntries[key];
+        count++;
+      }
+    });
+
+    nameMapReady = true;
+    console.log('[SWGoH] Loaded', count, 'unit names.');
+    // Log a few samples to verify
+    var samples = ['JEDIKNIGHTREVAN', 'GRANDADMIRALTHRAWN', 'GLREY', 'JEDIMASTERKENOBI'];
+    samples.forEach(function(s) {
+      if (unitNameMap[s]) console.log('[SWGoH]   ', s, '→', unitNameMap[s]);
+    });
+  } catch (err) {
+    console.error('[SWGoH] Failed to load unit names:', err.message);
+    console.log('[SWGoH] Will use cleaned-up unit IDs as fallback (the AI can still interpret them)');
+  }
+}
+
+// Reload names every 24 hours (game updates add new units)
+setInterval(loadUnitNames, 24 * 60 * 60 * 1000);
+
+// ===== SYSTEM PROMPT =====
 const SYSTEM_PROMPT = [
 "You are an expert coach and strategist for the game Star Wars Galaxy of Heroes.",
 "",
 "Your goal is to help the player level up their characters and rise through the ranks by providing expert insight about their current roster, advice about which teams to use in specific battles and events, and strategy on who to be leveling and what characters to be working towards next.",
 "",
 "IMPORTANT: You have access to the player's COMPLETE roster — every character and every ship they own. The data is provided in a compact pipe-delimited format:",
-"  Characters: Name|GP|G(ear level)|Stars*|R(elic tier)|Z(zeta count)|O(omicron count)",
-"  Ships: Name|GP|Stars*",
+"  Characters: Name|G(ear level)|Stars*|R(elic tier)|Z(zeta count)|O(omicron count)|Lvl",
+"  Ships: Name|Stars*|Lvl",
 "When answering questions, always reference the player's actual units and stats. If a player asks about a character they don't own, let them know it's not in their roster yet.",
 "",
 "Goal: Help the player win as much as possible and help them level characters as quickly and efficiently as possible.",
@@ -84,9 +173,7 @@ function validateAllyCode(code) {
   return /^[0-9]{9}$/.test(code.replace(/[^0-9]/g, ""));
 }
 
-// ===== PLAYER DATA ENDPOINT =====
-// Proxies swgoh.gg endpoints and bundles into one response
-// Option A: Enhanced browser-mimicking headers to bypass Cloudflare
+// ===== PLAYER DATA ENDPOINT (via swgoh-comlink) =====
 app.get('/api/player/:code', async function(req, res) {
   try {
     var clientIp = req.ip || req.connection.remoteAddress || 'unknown';
@@ -99,87 +186,139 @@ app.get('/api/player/:code', async function(req, res) {
       return res.status(400).json({ error: 'Invalid ally code format.' });
     }
 
-    // Full browser-like headers — Cloudflare checks many of these
-    var swgohHeaders = {
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'DNT': '1',
-      'Pragma': 'no-cache',
-      'Referer': 'https://swgoh.gg/p/' + code + '/',
-      'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"Windows"',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-origin',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    };
+    console.log('[SWGoH] Fetching player', code, 'from comlink');
 
-    var opts = { headers: swgohHeaders, signal: AbortSignal.timeout(15000) };
+    // POST to comlink /player endpoint
+    var playerRes = await fetch(COMLINK_URL + '/player', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payload: { allyCode: code },
+        enums: false
+      }),
+      signal: AbortSignal.timeout(20000)
+    });
 
-    // First try the main player endpoint
-    console.log('[SWGoH] Fetching player data for', code);
-    var playerRes = await fetch('https://swgoh.gg/api/player/' + code + '/', opts);
-    
-    console.log('[SWGoH] Player endpoint status:', playerRes.status);
-    if (playerRes.status === 404) {
-      return res.status(404).json({ error: 'Ally code not found.' });
+    if (!playerRes.ok) {
+      var status = playerRes.status;
+      console.error('[SWGoH] Comlink /player error:', status);
+      if (status === 400) return res.status(404).json({ error: 'Ally code not found.' });
+      return res.status(502).json({ error: 'Comlink error (' + status + '). Is comlink running?' });
     }
-    if (playerRes.status === 403) {
-      console.error('[SWGoH] 403 Forbidden — swgoh.gg is blocking server requests.');
-      return res.status(403).json({ 
-        error: 'swgoh.gg is currently blocking API requests. The site may have added bot protection.',
-        suggestion: 'Try again in a few minutes, or the app may need to switch to swgoh-comlink.'
+
+    var raw = await playerRes.json();
+    console.log('[SWGoH] Comlink response — name:', raw.name, 'units:', (raw.rosterUnit || []).length);
+
+    // ===== TRANSFORM comlink → frontend format =====
+    var rosterUnits = raw.rosterUnit || [];
+
+    // Extract GP from profileStat array
+    var gpTotal = 0, gpChar = 0, gpShip = 0;
+    (raw.profileStat || []).forEach(function(s) {
+      var key = (s.nameKey || '').toUpperCase();
+      var val = parseInt(s.value) || 0;
+      if (key.indexOf('GALACTIC_POWER') >= 0 && key.indexOf('CHAR') < 0 && key.indexOf('SHIP') < 0) gpTotal = val;
+      if (key.indexOf('CHAR') >= 0 && key.indexOf('GALACTIC') >= 0) gpChar = val;
+      if (key.indexOf('SHIP') >= 0 && key.indexOf('GALACTIC') >= 0) gpShip = val;
+    });
+
+    // If nameKey-based extraction didn't work, try index-based
+    // profileStat indices: typically index 0 = total GP, but varies
+    if (gpTotal === 0 && raw.profileStat && raw.profileStat.length > 0) {
+      raw.profileStat.forEach(function(s) {
+        var id = s.index || s.statId || s.id || '';
+        var val = parseInt(s.value) || 0;
+        if (id === '1' || id === 1) gpTotal = val;
       });
     }
-    if (!playerRes.ok) {
-      return res.status(502).json({ error: 'swgoh.gg error (' + playerRes.status + ')' });
-    }
 
-    var playerData = await playerRes.json();
+    // Parse each roster unit
+    var characters = [];
+    var ships = [];
 
-    // Now fetch characters and ships in parallel
-    var results = await Promise.allSettled([
-      fetch('https://swgoh.gg/api/player/' + code + '/characters/', opts),
-      fetch('https://swgoh.gg/api/player/' + code + '/ships/',      opts),
-    ]);
+    rosterUnits.forEach(function(unit) {
+      var baseId = (unit.definitionId || '').split(':')[0];
+      var name = getUnitName(unit.definitionId);
+      var stars = unit.currentRarity || 0;
+      var level = unit.currentLevel || 0;
+      var gear = unit.currentTier || 0;
 
-    var chars = [], ships = [];
-    if (results[0].status === 'fulfilled' && results[0].value.ok) {
-      var charsJson = await results[0].value.json();
-      chars = Array.isArray(charsJson) ? charsJson : (charsJson.results || []);
-      console.log('[SWGoH] Characters fetched:', chars.length);
-    } else {
-      console.log('[SWGoH] Characters endpoint failed:', results[0].value?.status || results[0].reason?.message);
-    }
-    if (results[1].status === 'fulfilled' && results[1].value.ok) {
-      var shipsJson = await results[1].value.json();
-      ships = Array.isArray(shipsJson) ? shipsJson : (shipsJson.results || []);
-      console.log('[SWGoH] Ships fetched:', ships.length);
-    } else {
-      console.log('[SWGoH] Ships endpoint failed:', results[1].value?.status || results[1].reason?.message);
-    }
+      // Relic: comlink currentTier where display = currentTier - 2
+      var relicRaw = (unit.relic && unit.relic.currentTier) ? unit.relic.currentTier : 0;
+      var relicDisplay = relicRaw > 2 ? relicRaw - 2 : 0;
 
-    // Also check if main endpoint already included units
-    if (chars.length === 0 && ships.length === 0 && playerData.units) {
-      console.log('[SWGoH] Using units from main endpoint:', playerData.units.length);
-    }
+      // Count zetas and omicrons from skills
+      var zetas = 0, omicrons = 0;
+      (unit.skill || []).forEach(function(sk) {
+        if (sk.tier >= 8) zetas++;
+      });
+      // Omicrons: check purchasedAbilityId or ability naming patterns
+      (unit.purchasedAbilityId || []).forEach(function(abilityId) {
+        if (abilityId && abilityId.toLowerCase().indexOf('omicron') >= 0) omicrons++;
+      });
 
-    playerData.characters = chars;
-    playerData.ships = ships;
+      // combatType: 1 = character, 2 = ship
+      var combatType = unit.combatType || 0;
+      if (!combatType) {
+        // Infer: ships don't have gear or relics
+        combatType = (gear > 1 || relicRaw > 0) ? 1 : 2;
+      }
 
-    console.log('[SWGoH] Success — Chars:', chars.length, 'Ships:', ships.length);
-    res.json(playerData);
+      var parsed = {
+        base_id: baseId,
+        name: name,
+        combat_type: combatType,
+        rarity: stars,
+        level: level,
+        gear_level: combatType === 1 ? gear : 0,
+        relic_tier: relicDisplay,
+        power: 0,
+        zeta_abilities: new Array(zetas),
+        omicron_abilities: new Array(omicrons),
+      };
+
+      if (combatType === 2) {
+        ships.push(parsed);
+      } else {
+        characters.push(parsed);
+      }
+    });
+
+    console.log('[SWGoH] Parsed — Characters:', characters.length, 'Ships:', ships.length, 'GP:', gpTotal);
+
+    // Build response matching what the frontend expects
+    var response = {
+      name: raw.name || 'Unknown',
+      ally_code: raw.allyCode || code,
+      galactic_power: gpTotal,
+      character_galactic_power: gpChar,
+      ship_galactic_power: gpShip,
+      guild_name: raw.guildName || '',
+      arena: { rank: null },
+      fleet_arena: { rank: null },
+      level: raw.level || 85,
+      characters: characters,
+      ships: ships,
+    };
+
+    // Extract arena ranks from pvpProfile if present
+    (raw.pvpProfile || []).forEach(function(pvp) {
+      var tab = parseInt(pvp.tab) || 0;
+      if (tab === 1) response.arena.rank = pvp.rank || null;
+      if (tab === 2) response.fleet_arena.rank = pvp.rank || null;
+    });
+
+    res.json(response);
 
   } catch (err) {
-    console.error('Player fetch error:', err.message);
-    if (err.name === 'TimeoutError') {
-      return res.status(504).json({ error: 'Request timed out. Try again.' });
+    console.error('[SWGoH] Player fetch error:', err.message);
+    if (err.name === 'TimeoutError' || (err.message && err.message.indexOf('timeout') >= 0)) {
+      return res.status(504).json({ error: 'Comlink request timed out. Try again.' });
     }
-    res.status(500).json({ error: 'Failed to fetch player data.' });
+    if (err.message && (err.message.indexOf('ECONNREFUSED') >= 0 || err.message.indexOf('fetch failed') >= 0)) {
+      return res.status(502).json({ error: 'Cannot reach comlink service. Is it running? Check COMLINK_URL env var.' });
+    }
+    res.status(500).json({ error: 'Failed to fetch player data: ' + err.message });
   }
 });
 
@@ -255,11 +394,27 @@ app.post('/api/chat', async function(req, res) {
 
 // ===== HEALTH CHECK =====
 app.get('/health', function(req, res) {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    comlink: COMLINK_URL,
+    nameMapLoaded: nameMapReady,
+    unitNamesCount: Object.keys(unitNameMap).length,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // ===== START SERVER =====
 var PORT = process.env.PORT || 3000;
-app.listen(PORT, function() {
-  console.log('SWGoH Coach API running on port ' + PORT);
+
+loadUnitNames().then(function() {
+  app.listen(PORT, function() {
+    console.log('SWGoH Coach API running on port ' + PORT);
+    console.log('Comlink URL:', COMLINK_URL);
+    console.log('Name map loaded:', nameMapReady, '(' + Object.keys(unitNameMap).length + ' units)');
+  });
+}).catch(function(err) {
+  console.error('Startup warning — name map failed (non-fatal):', err.message);
+  app.listen(PORT, function() {
+    console.log('SWGoH Coach API running on port ' + PORT + ' (using fallback names)');
+  });
 });
