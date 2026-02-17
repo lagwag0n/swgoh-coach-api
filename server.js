@@ -382,6 +382,28 @@ app.get('/api/player/:code', async function(req, res) {
       if (tab === 2) response.fleet_arena.rank = pvp.rank || null;
     });
 
+    // Extract currencies
+    var currencies = {};
+    (raw.currency || []).forEach(function(c) {
+      var id = (c.id || c.currencyId || '').toString().toUpperCase();
+      var qty = parseInt(c.quantity || c.value || 0);
+      // Map known currency IDs
+      if (id === '1' || id.indexOf('CREDIT') >= 0) currencies.credits = qty;
+      if (id === '2' || id.indexOf('CRYSTAL') >= 0) currencies.crystals = qty;
+      if (id === '3' || id.indexOf('ALLY_POINT') >= 0 || id.indexOf('ALLYPOINT') >= 0) currencies.ally_points = qty;
+      if (id === '4' || id.indexOf('CANTINA') >= 0) currencies.cantina = qty;
+      if (id === '5' || id.indexOf('SQUAD_ARENA') >= 0) currencies.squad_arena_tokens = qty;
+      if (id === '6' || id.indexOf('FLEET_ARENA') >= 0 || id.indexOf('SHIP_PRESTIGE') >= 0) currencies.fleet_tokens = qty;
+      if (id === '7' || id.indexOf('GALACTIC_WAR') >= 0) currencies.gw_tokens = qty;
+      if (id === '15' || id.indexOf('GUILD_EVENT_TOKEN_1') >= 0 || id === 'GET1') currencies.get1 = qty;
+      if (id === '16' || id.indexOf('GUILD_EVENT_TOKEN_2') >= 0 || id === 'GET2') currencies.get2 = qty;
+      if (id === '17' || id.indexOf('GUILD_EVENT_TOKEN_3') >= 0 || id === 'GET3') currencies.get3 = qty;
+    });
+    response.currencies = currencies;
+
+    // Log raw currency data for debugging
+    console.log('[SWGoH] Raw currency keys:', (raw.currency || []).map(function(c) { return (c.id || c.currencyId || '?') + '=' + (c.quantity || c.value || 0); }).join(', '));
+
     res.json(response);
 
   } catch (err) {
