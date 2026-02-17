@@ -85,7 +85,8 @@ function validateAllyCode(code) {
 }
 
 // ===== PLAYER DATA ENDPOINT =====
-// Proxies all three swgoh.gg endpoints and bundles into one response
+// Proxies swgoh.gg endpoints and bundles into one response
+// Option A: Enhanced browser-mimicking headers to bypass Cloudflare
 app.get('/api/player/:code', async function(req, res) {
   try {
     var clientIp = req.ip || req.connection.remoteAddress || 'unknown';
@@ -98,46 +99,79 @@ app.get('/api/player/:code', async function(req, res) {
       return res.status(400).json({ error: 'Invalid ally code format.' });
     }
 
-    // Browser-like headers to avoid bot detection
+    // Full browser-like headers — Cloudflare checks many of these
     var swgohHeaders = {
       'Accept': 'application/json, text/plain, */*',
+      'Accept-Encoding': 'gzip, deflate, br',
       'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'DNT': '1',
+      'Pragma': 'no-cache',
+      'Referer': 'https://swgoh.gg/p/' + code + '/',
+      'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-      'Referer': 'https://swgoh.gg/',
-      'Origin': 'https://swgoh.gg'
     };
 
     var opts = { headers: swgohHeaders, signal: AbortSignal.timeout(15000) };
 
-    // Fetch player stats + characters + ships in parallel
+    // First try the main player endpoint
+    console.log('[SWGoH] Fetching player data for', code);
+    var playerRes = await fetch('https://swgoh.gg/api/player/' + code + '/', opts);
+    
+    console.log('[SWGoH] Player endpoint status:', playerRes.status);
+    if (playerRes.status === 404) {
+      return res.status(404).json({ error: 'Ally code not found.' });
+    }
+    if (playerRes.status === 403) {
+      console.error('[SWGoH] 403 Forbidden — swgoh.gg is blocking server requests.');
+      return res.status(403).json({ 
+        error: 'swgoh.gg is currently blocking API requests. The site may have added bot protection.',
+        suggestion: 'Try again in a few minutes, or the app may need to switch to swgoh-comlink.'
+      });
+    }
+    if (!playerRes.ok) {
+      return res.status(502).json({ error: 'swgoh.gg error (' + playerRes.status + ')' });
+    }
+
+    var playerData = await playerRes.json();
+
+    // Now fetch characters and ships in parallel
     var results = await Promise.allSettled([
-      fetch(`https://swgoh.gg/api/player/${code}/`,            opts),
-      fetch(`https://swgoh.gg/api/player/${code}/characters/`, opts),
-      fetch(`https://swgoh.gg/api/player/${code}/ships/`,      opts),
+      fetch('https://swgoh.gg/api/player/' + code + '/characters/', opts),
+      fetch('https://swgoh.gg/api/player/' + code + '/ships/',      opts),
     ]);
 
-    var playerRes = results[0];
-    if (playerRes.status === 'rejected' || !playerRes.value.ok) {
-      var status = playerRes.value?.status;
-      if (status === 404) return res.status(404).json({ error: 'Ally code not found.' });
-      return res.status(502).json({ error: `swgoh.gg error (${status || 'network'})` });
-    }
-
-    var playerData = await playerRes.value.json();
-
     var chars = [], ships = [];
-    if (results[1].status === 'fulfilled' && results[1].value.ok) {
-      var charsJson = await results[1].value.json();
+    if (results[0].status === 'fulfilled' && results[0].value.ok) {
+      var charsJson = await results[0].value.json();
       chars = Array.isArray(charsJson) ? charsJson : (charsJson.results || []);
+      console.log('[SWGoH] Characters fetched:', chars.length);
+    } else {
+      console.log('[SWGoH] Characters endpoint failed:', results[0].value?.status || results[0].reason?.message);
     }
-    if (results[2].status === 'fulfilled' && results[2].value.ok) {
-      var shipsJson = await results[2].value.json();
+    if (results[1].status === 'fulfilled' && results[1].value.ok) {
+      var shipsJson = await results[1].value.json();
       ships = Array.isArray(shipsJson) ? shipsJson : (shipsJson.results || []);
+      console.log('[SWGoH] Ships fetched:', ships.length);
+    } else {
+      console.log('[SWGoH] Ships endpoint failed:', results[1].value?.status || results[1].reason?.message);
+    }
+
+    // Also check if main endpoint already included units
+    if (chars.length === 0 && ships.length === 0 && playerData.units) {
+      console.log('[SWGoH] Using units from main endpoint:', playerData.units.length);
     }
 
     playerData.characters = chars;
     playerData.ships = ships;
 
+    console.log('[SWGoH] Success — Chars:', chars.length, 'Ships:', ships.length);
     res.json(playerData);
 
   } catch (err) {
