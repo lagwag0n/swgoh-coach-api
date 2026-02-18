@@ -524,7 +524,7 @@ app.post('/api/chat', async function(req, res) {
 
     // Call Claude Sonnet 4.6 with web search tool
     var response = await anthropic.messages.create({
-      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6-20250217',
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 2000,
       system: systemPrompt,
       messages: messages,
@@ -567,7 +567,7 @@ app.post('/api/chat', async function(req, res) {
 app.get('/health', function(req, res) {
   res.json({
     status: 'ok',
-    ai_model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6-20250217',
+    ai_model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
     web_search: true,
     comlink: COMLINK_URL,
     nameMapLoaded: nameMapReady,
