@@ -185,14 +185,16 @@ const SYSTEM_PROMPT = [
 "Your goal is to help the player level up their characters and rise through the ranks by providing expert insight about their current roster, advice about which teams to use in specific battles and events, and strategy on who to be leveling and what characters to be working towards next.",
 "",
 "IMPORTANT: You have access to the player's COMPLETE roster — every character and every ship they own. The data is provided in a compact pipe-delimited format:",
-"  Characters: Name|G(ear level)|Stars*|R(elic tier)|Z(zeta count)|O(omicron count)|Lvl",
+"  Characters: Name|G(ear level)|Stars*|R(elic tier)|Z(zeta count)|O(omicron count)|Lvl|ModSpeed[ModSets]",
 "  Ships: Name|Stars*|Lvl",
+"  Datacrons: ID|Level|Set|Bonuses",
+"  Mod info shows total speed bonus from mods (e.g. +125Spd) and mod sets equipped (e.g. [Spd(4)+HP(2)] means 4 speed set mods + 2 health set mods).",
 "When answering questions, always reference the player's actual units and stats. If a player asks about a character they don't own, let them know it's not in their roster yet.",
 "",
 "Goal: Help the player win as much as possible and help them level characters as quickly and efficiently as possible.",
 "",
 "Your Job:",
-"- Advise on how to create the strongest defensive and offensive teams in Grand Arena (3v3 and 5v5) based on their available roster and the most up-to-date game meta.",
+"- Advise on how to create the strongest defensive and offensive teams in Grand Arena (3v3 and 5v5) based on their current roster.",
 "- Show the best techniques/hacks for quickly farming/crafting valuable materials.",
 "- Coach them through what teams to aim for next based on their current roster.",
 "- Explain complicated game mechanics and confusing concepts in simple yet intelligent terms.",
@@ -341,6 +343,37 @@ app.get('/api/player/:code', async function(req, res) {
         if (abilityId && abilityId.toLowerCase().indexOf('omicron') >= 0) omicrons++;
       });
 
+      // Extract equipped mods (equippedStatMod array on each unit)
+      var mods = [];
+      (unit.equippedStatMod || unit.modList || []).forEach(function(mod) {
+        var modData = {};
+        // Mod slot (1-6), level, tier/rarity (dots), set
+        modData.slot = mod.definitionId ? parseInt(String(mod.definitionId).slice(-2, -1)) || 0 : (mod.slot || 0);
+        modData.level = mod.level || 0;
+        modData.tier = mod.tier || mod.rarity || 0;
+        modData.set = mod.setId || mod.set || '';
+
+        // Primary stat
+        if (mod.primaryStat || mod.primaryBonusType) {
+          modData.primary = {
+            stat: mod.primaryStat?.stat?.unitStatId || mod.primaryBonusType || '',
+            value: parseInt(mod.primaryStat?.stat?.unscaledDecimalValue || mod.primaryBonusValue || 0)
+          };
+        }
+
+        // Secondary stats
+        modData.secondaries = [];
+        (mod.secondaryStat || mod.secondaryBonusList || []).forEach(function(sec) {
+          modData.secondaries.push({
+            stat: sec.stat?.unitStatId || sec.unitStatId || sec.bonusType || '',
+            value: parseInt(sec.stat?.unscaledDecimalValue || sec.value || sec.bonusValue || 0),
+            rolls: sec.statRolls || sec.roll || 0
+          });
+        });
+
+        mods.push(modData);
+      });
+
       // combatType: 1 = character, 2 = ship
       var combatType = unit.combatType || 0;
       if (!combatType) {
@@ -359,6 +392,7 @@ app.get('/api/player/:code', async function(req, res) {
         power: 0,
         zeta_abilities: new Array(zetas),
         omicron_abilities: new Array(omicrons),
+        mods: combatType === 1 ? mods : [],
       };
 
       if (combatType === 2) {
@@ -430,6 +464,45 @@ app.get('/api/player/:code', async function(req, res) {
     response.currencies = currencies;
 
     console.log('[SWGoH] Parsed currencies:', JSON.stringify(currencies));
+
+    // Extract datacrons
+    var datacrons = [];
+    var datacronArray = raw.datacron || raw.datacronList || [];
+    console.log('[SWGoH] Datacron array length:', datacronArray.length);
+    if (datacronArray.length > 0) {
+      console.log('[SWGoH] Datacron sample:', JSON.stringify(datacronArray[0]).slice(0, 500));
+    }
+
+    datacronArray.forEach(function(dc) {
+      var dcData = {
+        id: dc.id || '',
+        setId: dc.setId || dc.templateId || '',
+        level: dc.tier || dc.level || 0,
+        locked: dc.locked || false,
+        targetRule: dc.targetRule || '',
+        affix: []
+      };
+
+      // Parse affixes (the stat bonuses and abilities)
+      (dc.affix || dc.affixList || []).forEach(function(af) {
+        var affixInfo = {
+          id: af.targetRule || af.abilityId || af.id || '',
+          scope: af.scopeIcon || af.scope || '',
+          ability: af.abilityId || ''
+        };
+        // Stat bonuses
+        if (af.statType || af.stat) {
+          affixInfo.stat = af.statType || (af.stat && af.stat.unitStatId) || '';
+          affixInfo.value = parseInt(af.statValue || (af.stat && af.stat.unscaledDecimalValue) || 0);
+        }
+        dcData.affix.push(affixInfo);
+      });
+
+      datacrons.push(dcData);
+    });
+
+    response.datacrons = datacrons;
+    console.log('[SWGoH] Parsed datacrons:', datacrons.length);
 
     res.json(response);
 
