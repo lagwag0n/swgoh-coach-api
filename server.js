@@ -185,10 +185,10 @@ const SYSTEM_PROMPT = [
 "Your goal is to help the player win every battle. You use advanced strategies and creative tactics to help the player level up their characters and rise through the ranks. You provide expert insight about their current roster, advice about which teams to use in specific battles and events, and strategy on who to be leveling and what characters to be working towards next. Use both long term and short term strategies to help the player dominate.",
 "",
 "IMPORTANT: You have access to the player's COMPLETE roster — every character and every ship they own. The data is provided in a compact pipe-delimited format:",
-"  Characters: Name|G(ear level)|Stars*|R(elic tier)|Z(zeta count)|O(omicron count)|Lvl|ModSpeed[ModSets]",
+"  Characters: Name|G(ear level)|Stars*|R(elic tier)|Z(zeta count)|O(omicron count)|Lvl|ModSpeed or ModCount",
 "  Ships: Name|Stars*|Lvl",
 "  Datacrons: ID|Level|Set|Bonuses",
-"  Mod info shows total speed bonus from mods (e.g. +125Spd) and mod sets equipped (e.g. [Spd(4)+HP(2)] means 4 speed set mods + 2 health set mods).",
+"  Mod info shows total speed bonus from mods (e.g. +125Spd means 125 total speed from all 6 mods combined). If speed can't be calculated, shows mod count (e.g. 6mods).",
 "When answering questions, always reference the player's actual units and stats. If a player asks about a character they don't own, let them know it's not in their roster yet.",
 "",
 "Goal: Help the player win every battle and help them level characters as quickly and efficiently as possible.",
@@ -328,6 +328,27 @@ app.get('/api/player/:code', async function(req, res) {
     var characters = [];
     var ships = [];
 
+    // DEBUG: Log first character unit structure (remove after confirming)
+    var debugLogged = false;
+    rosterUnits.forEach(function(unit) {
+      if (!debugLogged && (unit.combatType === 1 || (unit.currentTier && unit.currentTier > 1))) {
+        console.log('[SWGoH] === DEBUG: First character unit ===');
+        console.log('[SWGoH] Unit keys:', Object.keys(unit).join(', '));
+        if (unit.skill && unit.skill.length > 0) {
+          console.log('[SWGoH] Skill[0]:', JSON.stringify(unit.skill[0]).slice(0, 300));
+          var highSkill = unit.skill.find(function(s) { return s.tier >= 7; });
+          if (highSkill) console.log('[SWGoH] High-tier skill:', JSON.stringify(highSkill).slice(0, 300));
+        }
+        if (unit.equippedStatMod && unit.equippedStatMod.length > 0) {
+          console.log('[SWGoH] equippedStatMod[0]:', JSON.stringify(unit.equippedStatMod[0]).slice(0, 600));
+        } else {
+          var modFields = Object.keys(unit).filter(function(k) { return k.toLowerCase().indexOf('mod') >= 0; });
+          console.log('[SWGoH] No equippedStatMod. Mod-like fields:', modFields.join(', ') || 'NONE');
+        }
+        debugLogged = true;
+      }
+    });
+
     rosterUnits.forEach(function(unit) {
       var baseId = (unit.definitionId || '').split(':')[0];
       var name = getUnitName(unit.definitionId);
@@ -340,42 +361,54 @@ app.get('/api/player/:code', async function(req, res) {
       var relicDisplay = relicRaw > 2 ? relicRaw - 2 : 0;
 
       // Count zetas and omicrons from skills
+      // Comlink skill structure: { id: <String>, tier: <Integer> }
+      // Zeta = skill at tier 8, Omicron = skill at tier 9
+      // A skill at tier 9 has BOTH zeta AND omicron applied
       var zetas = 0, omicrons = 0;
       (unit.skill || []).forEach(function(sk) {
-        if (sk.tier >= 8) zetas++;
-      });
-      // Omicrons: check purchasedAbilityId or ability naming patterns
-      (unit.purchasedAbilityId || []).forEach(function(abilityId) {
-        if (abilityId && abilityId.toLowerCase().indexOf('omicron') >= 0) omicrons++;
+        if (sk.tier >= 8) zetas++;   // tier 8+ means zeta is applied
+        if (sk.tier >= 9) omicrons++; // tier 9 means omicron is also applied
       });
 
-      // Extract equipped mods (equippedStatMod array on each unit)
+      // Extract equipped mods
+      // Comlink structure per swgoh-stat-calc docs:
+      //   equippedStatMod: [{
+      //     definitionId: <String>, level: <Integer>, tier: <Integer>,
+      //     primaryStat: { stat: { unitStat: <Int>, unscaledDecimalValue: <Int> } },
+      //     secondaryStat: [{ stat: { unitStatId: <Int>, unscaledDecimalValue: <Int> } }]
+      //   }]
       var mods = [];
-      (unit.equippedStatMod || unit.modList || []).forEach(function(mod) {
-        var modData = {};
-        // Mod slot (1-6), level, tier/rarity (dots), set
-        modData.slot = mod.definitionId ? parseInt(String(mod.definitionId).slice(-2, -1)) || 0 : (mod.slot || 0);
-        modData.level = mod.level || 0;
-        modData.tier = mod.tier || mod.rarity || 0;
-        modData.set = mod.setId || mod.set || '';
+      var rawMods = unit.equippedStatMod || [];
+      rawMods.forEach(function(mod) {
+        var modData = {
+          definitionId: mod.definitionId || '',
+          level: mod.level || 0,
+          tier: mod.tier || 0,
+          primary: null,
+          secondaries: []
+        };
 
-        // Primary stat
-        if (mod.primaryStat || mod.primaryBonusType) {
+        // Primary stat — uses "unitStat" (NOT unitStatId)
+        if (mod.primaryStat && mod.primaryStat.stat) {
           modData.primary = {
-            stat: mod.primaryStat?.stat?.unitStatId || mod.primaryBonusType || '',
-            value: parseInt(mod.primaryStat?.stat?.unscaledDecimalValue || mod.primaryBonusValue || 0)
+            stat: String(mod.primaryStat.stat.unitStat || mod.primaryStat.stat.unitStatId || ''),
+            value: parseInt(mod.primaryStat.stat.unscaledDecimalValue || 0)
           };
         }
 
-        // Secondary stats
-        modData.secondaries = [];
-        (mod.secondaryStat || mod.secondaryBonusList || []).forEach(function(sec) {
-          modData.secondaries.push({
-            stat: sec.stat?.unitStatId || sec.unitStatId || sec.bonusType || '',
-            value: parseInt(sec.stat?.unscaledDecimalValue || sec.value || sec.bonusValue || 0),
-            rolls: sec.statRolls || sec.roll || 0
-          });
+        // Secondary stats — uses "unitStatId"
+        (mod.secondaryStat || []).forEach(function(sec) {
+          if (sec.stat) {
+            modData.secondaries.push({
+              stat: String(sec.stat.unitStatId || sec.stat.unitStat || ''),
+              value: parseInt(sec.stat.unscaledDecimalValue || 0),
+              rolls: sec.statRolls || 0
+            });
+          }
         });
+
+        mods.push(modData);
+      });
 
         mods.push(modData);
       });
@@ -409,6 +442,15 @@ app.get('/api/player/:code', async function(req, res) {
     });
 
     console.log('[SWGoH] Parsed — Characters:', characters.length, 'Ships:', ships.length, 'GP:', gpTotal);
+    
+    // Summary: count how many chars have mods/zetas/omicrons
+    var modCount = 0, zetaTotal = 0, omicronTotal = 0;
+    characters.forEach(function(c) {
+      if (c.mods && c.mods.length > 0) modCount++;
+      zetaTotal += (c.zeta_abilities || []).length;
+      omicronTotal += (c.omicron_abilities || []).length;
+    });
+    console.log('[SWGoH] Characters with mods:', modCount, '| Total zetas:', zetaTotal, '| Total omicrons:', omicronTotal);
 
     // Build response matching what the frontend expects
     var response = {
