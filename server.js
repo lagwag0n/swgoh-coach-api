@@ -410,9 +410,6 @@ app.get('/api/player/:code', async function(req, res) {
         mods.push(modData);
       });
 
-        mods.push(modData);
-      });
-
       // combatType: 1 = character, 2 = ship
       var combatType = unit.combatType || 0;
       if (!combatType) {
