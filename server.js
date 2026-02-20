@@ -249,40 +249,30 @@ async function loadSkillData() {
       var skillId = skill.id || '';
       if (!skillId) return;
 
-      // Determine max tier from tierList or tier array
+      // Tier array: index 0 = tier 2 in-game (tier 1 is the base before any upgrades)
       var tiers = skill.tierList || skill.tier || [];
-      var maxTier = tiers.length + 1; // +1 because base tier is tier 1
+      var maxTier = tiers.length + 1;
       var isZeta = skill.isZeta || false;
+      var omicronMode = skill.omicronMode || 0;
 
-      // Scan tiers for omicronMode
-      // Each tier in the array may have an "omicronMode" field
+      // Scan tiers for isZetaTier and isOmicronTier boolean flags
+      var zetaTier = 0;
       var omicronTier = 0;
-      var omicronMode = 0;
       tiers.forEach(function(t, idx) {
-        // Tier index 0 in array = tier 2 in-game (tier 1 is the base)
-        var tierNum = idx + 2;
-        if (t.omicronMode && t.omicronMode > 0) {
-          omicronTier = tierNum;
-          omicronMode = t.omicronMode;
-        }
+        var tierNum = idx + 2; // tier array index 0 = in-game tier 2
+        if (t.isZetaTier === true) zetaTier = tierNum;
+        if (t.isOmicronTier === true) omicronTier = tierNum;
       });
-
-      // Also check for powerOverrideTags as indicator of special tiers
-      if (omicronTier === 0 && skill.powerOverrideTags && skill.powerOverrideTags.length > 0) {
-        // Skills with powerOverrideTags and maxTier >= 9 likely have omicrons
-        if (maxTier >= 9) {
-          omicronTier = maxTier; // assume omicron is at max tier
-        }
-      }
 
       skillDataMap[skillId] = {
         isZeta: isZeta,
         maxTier: maxTier,
+        zetaTier: zetaTier,
         omicronTier: omicronTier,
-        omicronMode: omicronMode
+        omicronMode: omicronTier > 0 ? omicronMode : 0
       };
 
-      if (isZeta) zetaCount++;
+      if (zetaTier > 0) zetaCount++;
       if (omicronTier > 0) omicronCount++;
     });
 
@@ -296,7 +286,7 @@ async function loadSkillData() {
     }).slice(0, 5);
     omicronSamples.forEach(function(k) {
       var s = skillDataMap[k];
-      console.log('[SWGoH]   Omicron skill:', k, '→ maxTier:', s.maxTier, 'omicronTier:', s.omicronTier, 'mode:', s.omicronMode);
+      console.log('[SWGoH]   Omicron skill:', k, '→ maxTier:', s.maxTier, 'zetaTier:', s.zetaTier, 'omicronTier:', s.omicronTier, 'mode:', s.omicronMode);
     });
 
   } catch (err) {
@@ -475,9 +465,10 @@ app.get('/api/player/:code', async function(req, res) {
               var def = skillDataMap[sk.id];
               if (def) {
                 console.log('[SWGoH]   Skill', sk.id, 'playerTier:', sk.tier, 
-                  'maxTier:', def.maxTier, 'isZeta:', def.isZeta, 
+                  'maxTier:', def.maxTier, 'zetaTier:', def.zetaTier, 
                   'omicronTier:', def.omicronTier, 'omicronMode:', def.omicronMode,
-                  '→', (def.omicronTier > 0 && sk.tier >= def.omicronTier) ? 'OMICRON APPLIED' : 'no omicron');
+                  '→', (def.omicronTier > 0 && sk.tier >= def.omicronTier) ? 'OMICRON APPLIED' : 
+                       (def.zetaTier > 0 && sk.tier >= def.zetaTier) ? 'ZETA APPLIED' : 'no special');
               } else {
                 console.log('[SWGoH]   Skill', sk.id, 'playerTier:', sk.tier, '→ NOT IN SKILL MAP');
               }
@@ -513,8 +504,7 @@ app.get('/api/player/:code', async function(req, res) {
         var skillDef = skillDataMap[sk.id];
         if (skillDef && skillDataReady) {
           // Use game data: check if player tier meets zeta/omicron thresholds
-          if (skillDef.isZeta && sk.tier >= (skillDef.maxTier - 1)) zetas++;
-          else if (sk.tier >= 8) zetas++; // fallback for zeta if not flagged in data
+          if (skillDef.zetaTier > 0 && sk.tier >= skillDef.zetaTier) zetas++;
           if (skillDef.omicronTier > 0 && sk.tier >= skillDef.omicronTier) {
             omicrons++;
             omicronDetails.push(sk.id + ':T' + sk.tier + '/' + skillDef.omicronTier);
@@ -1108,7 +1098,7 @@ Promise.all([
   })
 ]).then(function() {
   app.listen(PORT, function() {
-    console.log('SWGoH Coach API v2.1 running on port ' + PORT);
+    console.log('SWGoH Coach API v2.2 running on port ' + PORT);
     console.log('Comlink URL:', COMLINK_URL);
     console.log('Name map loaded:', nameMapReady, '(' + Object.keys(unitNameMap).length + ' units)');
     console.log('Skill data loaded:', skillDataReady, '(' + Object.keys(skillDataMap).length + ' skills)');
