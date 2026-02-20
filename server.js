@@ -882,6 +882,129 @@ app.get('/debug-names', function(req, res) {
   });
 });
 
+// ===== DEBUG: Probe comlink /data to find skill collection =====
+app.get('/debug-gamedata', async function(req, res) {
+  try {
+    // Get metadata for version
+    var metaRes = await fetch(COMLINK_URL + '/metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: {} }),
+      signal: AbortSignal.timeout(15000)
+    });
+    var meta = await metaRes.json();
+    var gameVersion = meta.latestGamedataVersion;
+
+    var results = {
+      gameVersion: gameVersion,
+      skillDataReady: skillDataReady,
+      skillMapSize: Object.keys(skillDataMap).length,
+      probes: {}
+    };
+
+    // Probe 1: Try items='skill'
+    try {
+      var r1 = await fetch(COMLINK_URL + '/data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          payload: { version: gameVersion, includePveUnits: false, requestSegment: 0, items: 'skill' },
+          enums: false
+        }),
+        signal: AbortSignal.timeout(30000)
+      });
+      var d1 = await r1.json();
+      var keys1 = Object.keys(d1);
+      var skillLike1 = keys1.filter(function(k) { return k.toLowerCase().indexOf('skill') >= 0; });
+      results.probes['items_skill'] = {
+        status: r1.status,
+        topKeys: keys1.slice(0, 30),
+        totalKeys: keys1.length,
+        skillLikeKeys: skillLike1,
+        arrayCounts: {}
+      };
+      // For each key, report if it's an array and its length
+      keys1.forEach(function(k) {
+        if (Array.isArray(d1[k])) {
+          results.probes['items_skill'].arrayCounts[k] = d1[k].length;
+          // If it looks like skills, sample the first item
+          if (d1[k].length > 0 && d1[k].length < 5000) {
+            var sample = d1[k][0];
+            if (sample && (sample.id || sample.skillId || sample.tier || sample.tierList || sample.tiers)) {
+              results.probes['items_skill']['sample_' + k] = JSON.stringify(sample).slice(0, 500);
+            }
+          }
+        }
+      });
+    } catch(e) { results.probes['items_skill'] = { error: e.message }; }
+
+    // Probe 2: Try segment 1 (just get keys, not full data)
+    try {
+      var r2 = await fetch(COMLINK_URL + '/data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          payload: { version: gameVersion, includePveUnits: false, requestSegment: 1 },
+          enums: false
+        }),
+        signal: AbortSignal.timeout(30000)
+      });
+      var d2 = await r2.json();
+      var keys2 = Object.keys(d2);
+      var skillLike2 = keys2.filter(function(k) { return k.toLowerCase().indexOf('skill') >= 0 || k.toLowerCase().indexOf('abil') >= 0; });
+      results.probes['segment_1'] = {
+        status: r2.status,
+        totalKeys: keys2.length,
+        allKeys: keys2,
+        skillOrAbilityKeys: skillLike2
+      };
+      // Check array sizes for skill-like keys
+      skillLike2.forEach(function(k) {
+        if (Array.isArray(d2[k])) {
+          results.probes['segment_1'][k + '_count'] = d2[k].length;
+          if (d2[k].length > 0) {
+            results.probes['segment_1'][k + '_sample'] = JSON.stringify(d2[k][0]).slice(0, 500);
+          }
+        }
+      });
+    } catch(e) { results.probes['segment_1'] = { error: e.message }; }
+
+    // Probe 3: Try segment 3
+    try {
+      var r3 = await fetch(COMLINK_URL + '/data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          payload: { version: gameVersion, includePveUnits: false, requestSegment: 3 },
+          enums: false
+        }),
+        signal: AbortSignal.timeout(30000)
+      });
+      var d3 = await r3.json();
+      var keys3 = Object.keys(d3);
+      var skillLike3 = keys3.filter(function(k) { return k.toLowerCase().indexOf('skill') >= 0 || k.toLowerCase().indexOf('abil') >= 0; });
+      results.probes['segment_3'] = {
+        status: r3.status,
+        totalKeys: keys3.length,
+        allKeys: keys3,
+        skillOrAbilityKeys: skillLike3
+      };
+      skillLike3.forEach(function(k) {
+        if (Array.isArray(d3[k])) {
+          results.probes['segment_3'][k + '_count'] = d3[k].length;
+          if (d3[k].length > 0) {
+            results.probes['segment_3'][k + '_sample'] = JSON.stringify(d3[k][0]).slice(0, 500);
+          }
+        }
+      });
+    } catch(e) { results.probes['segment_3'] = { error: e.message }; }
+
+    res.json(results);
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===== START SERVER =====
 var PORT = process.env.PORT || 3000;
 
@@ -895,9 +1018,10 @@ Promise.all([
   })
 ]).then(function() {
   app.listen(PORT, function() {
-    console.log('SWGoH Coach API running on port ' + PORT);
+    console.log('SWGoH Coach API v2.1 running on port ' + PORT);
     console.log('Comlink URL:', COMLINK_URL);
     console.log('Name map loaded:', nameMapReady, '(' + Object.keys(unitNameMap).length + ' units)');
     console.log('Skill data loaded:', skillDataReady, '(' + Object.keys(skillDataMap).length + ' skills)');
+    console.log('Debug endpoint: /debug-gamedata');
   });
 });
