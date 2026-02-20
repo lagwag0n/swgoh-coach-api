@@ -882,6 +882,96 @@ app.get('/debug-names', function(req, res) {
   });
 });
 
+// ===== DEBUG: Inspect raw skill structures to find omicron fields =====
+app.get('/debug-skills', async function(req, res) {
+  try {
+    var metaRes = await fetch(COMLINK_URL + '/metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: {} }),
+      signal: AbortSignal.timeout(15000)
+    });
+    var meta = await metaRes.json();
+    var gameVersion = meta.latestGamedataVersion;
+
+    var dataRes = await fetch(COMLINK_URL + '/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payload: { version: gameVersion, includePveUnits: false, requestSegment: 0, items: 'skill' },
+        enums: false
+      }),
+      signal: AbortSignal.timeout(60000)
+    });
+    var gameData = await dataRes.json();
+    var skills = gameData.skill || [];
+
+    // Analyze ALL fields across all skills to find omicron-related ones
+    var allFieldNames = {};
+    var allTierFieldNames = {};
+    var skillsWithOmicronFields = [];
+    var highTierSkills = [];
+    var powerOverrideSkills = [];
+
+    skills.forEach(function(skill) {
+      // Catalog all top-level fields
+      Object.keys(skill).forEach(function(k) { allFieldNames[k] = (allFieldNames[k] || 0) + 1; });
+
+      // Catalog all fields inside tier entries
+      var tiers = skill.tierList || skill.tier || [];
+      tiers.forEach(function(t) {
+        if (typeof t === 'object' && t !== null) {
+          Object.keys(t).forEach(function(k) { allTierFieldNames[k] = (allTierFieldNames[k] || 0) + 1; });
+        }
+      });
+
+      // Find skills with any field containing "omicron" (case insensitive)
+      var skillStr = JSON.stringify(skill).toLowerCase();
+      if (skillStr.indexOf('omicron') >= 0) {
+        skillsWithOmicronFields.push({
+          id: skill.id,
+          raw: JSON.stringify(skill).slice(0, 1000)
+        });
+      }
+
+      // Find skills with powerOverrideTags
+      if (skill.powerOverrideTags && skill.powerOverrideTags.length > 0) {
+        powerOverrideSkills.push({
+          id: skill.id,
+          tags: skill.powerOverrideTags,
+          isZeta: skill.isZeta,
+          maxTier: (skill.tierList || skill.tier || []).length + 1
+        });
+      }
+
+      // Find skills with high maxTier (9+)
+      var maxT = (skill.tierList || skill.tier || []).length + 1;
+      if (maxT >= 9) {
+        highTierSkills.push({
+          id: skill.id,
+          maxTier: maxT,
+          isZeta: skill.isZeta || false,
+          raw: JSON.stringify(skill).slice(0, 800)
+        });
+      }
+    });
+
+    res.json({
+      totalSkills: skills.length,
+      allTopLevelFields: allFieldNames,
+      allTierEntryFields: allTierFieldNames,
+      skillsContainingOmicronText: skillsWithOmicronFields.length,
+      omicronSamples: skillsWithOmicronFields.slice(0, 5),
+      highTierSkills_count: highTierSkills.length,
+      highTierSamples: highTierSkills.slice(0, 5),
+      powerOverrideSkills_count: powerOverrideSkills.length,
+      powerOverrideSamples: powerOverrideSkills.slice(0, 10)
+    });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===== DEBUG: Probe comlink /data to find skill collection =====
 app.get('/debug-gamedata', async function(req, res) {
   try {
