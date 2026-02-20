@@ -593,37 +593,45 @@ app.get('/api/player/:code', async function(req, res) {
       var relicDisplay = relicRaw > 2 ? relicRaw - 2 : 0;
 
       // Count zetas and omicrons from skills
-      // Uses skill data map from game data when available, falls back to heuristic
+      // IMPORTANT: comlink player skill.tier is the number of upgrades applied.
+      // In-game tier = sk.tier + 1 (tier 0 in comlink = in-game tier 1, the base).
+      // skillDataMap stores in-game tier thresholds (e.g. zetaTier:8 means in-game tier 8).
       var zetas = 0, omicrons = 0;
-      var omicronDetails = []; // track which skills have omicrons for debugging
       (unit.skill || []).forEach(function(sk) {
         var skillDef = skillDataMap[sk.id];
+        var inGameTier = (sk.tier || 0) + 1;
         if (skillDef && skillDataReady) {
-          // Use game data: check if player tier meets zeta/omicron thresholds
-          if (skillDef.zetaTier > 0 && sk.tier >= skillDef.zetaTier) zetas++;
-          if (skillDef.omicronTier > 0 && sk.tier >= skillDef.omicronTier) {
-            omicrons++;
-            omicronDetails.push(sk.id + ':T' + sk.tier + '/' + skillDef.omicronTier);
-          }
+          if (skillDef.zetaTier > 0 && inGameTier >= skillDef.zetaTier) zetas++;
+          if (skillDef.omicronTier > 0 && inGameTier >= skillDef.omicronTier) omicrons++;
         } else {
-          // Fallback heuristic when game data not available
-          if (sk.tier >= 8) zetas++;
-          if (sk.tier >= 9) omicrons++;
+          // Fallback heuristic (in-game tier 8 = zeta, 9 = omicron)
+          if (inGameTier >= 8) zetas++;
+          if (inGameTier >= 9) omicrons++;
         }
       });
 
       // Extract equipped mods
-      // Comlink structure per swgoh-stat-calc docs:
-      //   equippedStatMod: [{
-      //     definitionId: <String>, level: <Integer>, tier: <Integer>,
-      //     primaryStat: { stat: { unitStat: <Int>, unscaledDecimalValue: <Int> } },
-      //     secondaryStat: [{ stat: { unitStatId: <Int>, unscaledDecimalValue: <Int> } }]
-      //   }]
-      // NOTE on unscaledDecimalValue scaling:
-      //   Flat integer stats (speed, HP, protection, offense, defense) are stored as
-      //   the raw integer value (e.g. speed 25 → stored as 25).
-      //   Percentage stats are stored as value * 1e8 (e.g. 5% → 5000000).
-      //   SPEED (statId 5) is ALWAYS a flat integer — never divide by 1e8.
+      // CONFIRMED from logs: unscaledDecimalValue encoding:
+      //   Percentage stats (CC, CD, potency, tenacity, offense%, defense%, HP%, prot%):
+      //     stored as percentage_as_decimal × 1,000,000
+      //     e.g. CC 1.385% → stored as 1385000 (1385000/1000000 = 1.385, display as 1.38%)
+      //   Flat integer stats (Speed, HP, Protection, Offense, Defense):
+      //     stored as flat_value × 10,000
+      //     e.g. speed 25 → stored as 250000 (250000/10000 = 25)
+      //   We detect by stat ID which category it falls into.
+      var PERCENT_STAT_IDS = {
+        '16':1, // Critical Damage
+        '17':1, // Potency
+        '18':1, // Tenacity
+        '48':1, // Offense %
+        '49':1, // Defense %
+        '52':1, // Dodge %
+        '53':1, // Critical Chance
+        '54':1, // Accuracy
+        '55':1, // HP %
+        '56':1, // Protection %
+      };
+
       var mods = [];
       var rawMods = unit.equippedStatMod || [];
       rawMods.forEach(function(mod) {
@@ -635,29 +643,30 @@ app.get('/api/player/:code', async function(req, res) {
           secondaries: []
         };
 
-        // Primary stat — uses "unitStat" (NOT unitStatId)
-        if (mod.primaryStat && mod.primaryStat.stat) {
-          var pStatId = String(mod.primaryStat.stat.unitStat || mod.primaryStat.stat.unitStatId || '');
-          var pVal = parseInt(mod.primaryStat.stat.unscaledDecimalValue || 0);
-          // Speed (statId=5) and other flat stats are stored as raw integers — no scaling needed.
-          // Percentage stats (e.g. offense%, defense%, CC%, CD%, potency%, tenacity%) are scaled by 1e8.
-          // Flat stat IDs: 1(HP), 5(Speed), 7(Armor), 8(Resistance), 28(Protection), 41(Offense), 42(Defense)
-          var FLAT_STAT_IDS = {'1':1,'5':1,'7':1,'8':1,'28':1,'41':1,'42':1};
-          if (!FLAT_STAT_IDS[pStatId] && pVal > 10000) {
-            pVal = Math.round(pVal / 1e8 * 100 * 100) / 100; // convert to percentage
+        function decodeStatValue(statId, rawVal) {
+          var v = parseInt(rawVal || 0);
+          if (PERCENT_STAT_IDS[String(statId)]) {
+            // Percentage stat: value/1,000,000 gives decimal (e.g. 0.01385), ×100 = 1.385%
+            return parseFloat((v / 1000000 * 100).toFixed(4));
           }
-          modData.primary = { stat: pStatId, value: pVal };
+          // Flat stat (speed, HP, etc.): value/10,000
+          return Math.round(v / 10000);
         }
 
-        // Secondary stats — uses "unitStatId"
+        if (mod.primaryStat && mod.primaryStat.stat) {
+          var pStatId = String(mod.primaryStat.stat.unitStat || mod.primaryStat.stat.unitStatId || '');
+          modData.primary = {
+            stat: pStatId,
+            value: decodeStatValue(pStatId, mod.primaryStat.stat.unscaledDecimalValue)
+          };
+        }
+
         (mod.secondaryStat || []).forEach(function(sec) {
           if (sec.stat) {
             var sStatId = String(sec.stat.unitStatId || sec.stat.unitStat || '');
-            var sVal = parseInt(sec.stat.unscaledDecimalValue || 0);
-            // Speed secondaries are always flat integers — no scaling
             modData.secondaries.push({
               stat: sStatId,
-              value: sVal,
+              value: decodeStatValue(sStatId, sec.stat.unscaledDecimalValue),
               rolls: sec.statRolls || 0
             });
           }
@@ -734,47 +743,44 @@ app.get('/api/player/:code', async function(req, res) {
       ships: ships,
     };
 
-    // Extract arena ranks from pvpProfile if present
-    // Dump ALL pvpProfile entries to console so we can see the exact structure
-    console.log('[SWGoH] pvpProfile raw:', JSON.stringify(raw.pvpProfile || []));
+    // Extract arena ranks from pvpProfile
+    // pvpProfile only has tab 1 (squad arena) and tab 2 (fleet arena)
+    // GA league/division lives in raw.seasonStatus and raw.playerRating.playerRankStatus
+    console.log('[SWGoH] pvpProfile tabs:', (raw.pvpProfile || []).map(function(p){ return p.tab; }).join(', '));
 
     response.grand_arena = { rank: null, league_tier: null, division_tier: null };
     (raw.pvpProfile || []).forEach(function(pvp) {
       var tab = parseInt(pvp.tab) || 0;
-      console.log('[SWGoH] pvpProfile tab', tab, 'keys:', Object.keys(pvp).join(', '), '| full:', JSON.stringify(pvp));
-
       if (tab === 1) response.arena.rank = pvp.rank || null;
       if (tab === 2) response.fleet_arena.rank = pvp.rank || null;
-      if (tab === 3) {
-        response.grand_arena.rank = pvp.rank || null;
-        // Try every field name variant comlink might use for league/division
-        // Pass them ALL through so the frontend can find whichever one has data
-        response.grand_arena.league_tier    = pvp.leagueId       || pvp.league       || pvp.leagueTier    || pvp.divisionGroup || null;
-        response.grand_arena.division_tier  = pvp.divisionId     || pvp.division     || pvp.divisionTier  || null;
-        response.grand_arena.league_name    = pvp.leagueName     || pvp.league_name  || null;
-        response.grand_arena.division_name  = pvp.divisionName   || pvp.division_name || null;
-        // Pass entire raw pvp object so frontend can inspect any field
-        response.grand_arena._raw           = pvp;
-      }
     });
 
-    // Also check if GA data lives elsewhere in the raw response (some comlink versions)
-    if (!response.grand_arena.rank && raw.grandArena) {
-      var ga = raw.grandArena;
-      response.grand_arena.rank         = ga.rank       || null;
-      response.grand_arena.league_tier  = ga.leagueId   || ga.league    || null;
-      response.grand_arena.division_tier = ga.divisionId || ga.division  || null;
-      response.grand_arena._raw         = ga;
-      console.log('[SWGoH] GA found in raw.grandArena:', JSON.stringify(ga));
+    // GA league + division: lives in seasonStatus array
+    // Each entry: { league: "BRONZIUM", division: 20, seasonPoints, wins, losses, ... }
+    // Take the most recent/active season (first entry with a league value)
+    var gaSeasonStatus = null;
+    (raw.seasonStatus || []).forEach(function(s) {
+      if (s.league && !gaSeasonStatus) gaSeasonStatus = s;
+    });
+    if (gaSeasonStatus) {
+      response.grand_arena.league_tier  = gaSeasonStatus.league;   // e.g. "BRONZIUM"
+      response.grand_arena.division_tier = gaSeasonStatus.division; // e.g. 20
+      // GA rank isn't in pvpProfile — use seasonPoints as proxy, or leave null
+      response.grand_arena.season_points = gaSeasonStatus.seasonPoints || null;
+      response.grand_arena.wins          = gaSeasonStatus.wins || 0;
+      response.grand_arena.losses        = gaSeasonStatus.losses || 0;
+      console.log('[SWGoH] GA from seasonStatus — league:', gaSeasonStatus.league, 'division:', gaSeasonStatus.division, 'points:', gaSeasonStatus.seasonPoints);
     }
-    if (!response.grand_arena.rank && raw.playerRating) {
-      // Some versions nest it here
-      var pr = raw.playerRating;
-      response.grand_arena.rank         = pr.pvpRank?.rank || null;
-      response.grand_arena.league_tier  = pr.pvpRank?.leagueId || null;
-      response.grand_arena.division_tier = pr.pvpRank?.divisionId || null;
-      response.grand_arena._raw         = pr;
-      console.log('[SWGoH] GA found in raw.playerRating:', JSON.stringify(pr).slice(0, 400));
+
+    // Also pull GA rank from playerRating.playerRankStatus if present
+    if (raw.playerRating && raw.playerRating.playerRankStatus) {
+      var prs = raw.playerRating.playerRankStatus;
+      // Only override if seasonStatus didn't give us league data
+      if (!response.grand_arena.league_tier) {
+        response.grand_arena.league_tier  = prs.leagueId   || null;
+        response.grand_arena.division_tier = prs.divisionId || null;
+      }
+      console.log('[SWGoH] playerRankStatus — leagueId:', prs.leagueId, 'divisionId:', prs.divisionId);
     }
 
     console.log('[SWGoH] Final GA data:', JSON.stringify(response.grand_arena));
