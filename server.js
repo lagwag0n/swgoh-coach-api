@@ -523,6 +523,11 @@ app.get('/api/player/:code', async function(req, res) {
       //     primaryStat: { stat: { unitStat: <Int>, unscaledDecimalValue: <Int> } },
       //     secondaryStat: [{ stat: { unitStatId: <Int>, unscaledDecimalValue: <Int> } }]
       //   }]
+      // NOTE on unscaledDecimalValue scaling:
+      //   Flat integer stats (speed, HP, protection, offense, defense) are stored as
+      //   the raw integer value (e.g. speed 25 → stored as 25).
+      //   Percentage stats are stored as value * 1e8 (e.g. 5% → 5000000).
+      //   SPEED (statId 5) is ALWAYS a flat integer — never divide by 1e8.
       var mods = [];
       var rawMods = unit.equippedStatMod || [];
       rawMods.forEach(function(mod) {
@@ -536,18 +541,27 @@ app.get('/api/player/:code', async function(req, res) {
 
         // Primary stat — uses "unitStat" (NOT unitStatId)
         if (mod.primaryStat && mod.primaryStat.stat) {
-          modData.primary = {
-            stat: String(mod.primaryStat.stat.unitStat || mod.primaryStat.stat.unitStatId || ''),
-            value: parseInt(mod.primaryStat.stat.unscaledDecimalValue || 0)
-          };
+          var pStatId = String(mod.primaryStat.stat.unitStat || mod.primaryStat.stat.unitStatId || '');
+          var pVal = parseInt(mod.primaryStat.stat.unscaledDecimalValue || 0);
+          // Speed (statId=5) and other flat stats are stored as raw integers — no scaling needed.
+          // Percentage stats (e.g. offense%, defense%, CC%, CD%, potency%, tenacity%) are scaled by 1e8.
+          // Flat stat IDs: 1(HP), 5(Speed), 7(Armor), 8(Resistance), 28(Protection), 41(Offense), 42(Defense)
+          var FLAT_STAT_IDS = {'1':1,'5':1,'7':1,'8':1,'28':1,'41':1,'42':1};
+          if (!FLAT_STAT_IDS[pStatId] && pVal > 10000) {
+            pVal = Math.round(pVal / 1e8 * 100 * 100) / 100; // convert to percentage
+          }
+          modData.primary = { stat: pStatId, value: pVal };
         }
 
         // Secondary stats — uses "unitStatId"
         (mod.secondaryStat || []).forEach(function(sec) {
           if (sec.stat) {
+            var sStatId = String(sec.stat.unitStatId || sec.stat.unitStat || '');
+            var sVal = parseInt(sec.stat.unscaledDecimalValue || 0);
+            // Speed secondaries are always flat integers — no scaling
             modData.secondaries.push({
-              stat: String(sec.stat.unitStatId || sec.stat.unitStat || ''),
-              value: parseInt(sec.stat.unscaledDecimalValue || 0),
+              stat: sStatId,
+              value: sVal,
               rolls: sec.statRolls || 0
             });
           }
@@ -613,17 +627,32 @@ app.get('/api/player/:code', async function(req, res) {
       guild_name: raw.guildName || '',
       arena: { rank: null },
       fleet_arena: { rank: null },
+      grand_arena: { rank: null, league_tier: null, division_tier: null, _raw: null },
       level: raw.level || 85,
       characters: characters,
       ships: ships,
     };
 
     // Extract arena ranks from pvpProfile if present
+    // tab 1 = Squad Arena, tab 2 = Fleet Arena, tab 3 = Grand Arena (GA)
+    response.grand_arena = { rank: null, league_tier: null, league_name: null };
     (raw.pvpProfile || []).forEach(function(pvp) {
       var tab = parseInt(pvp.tab) || 0;
       if (tab === 1) response.arena.rank = pvp.rank || null;
       if (tab === 2) response.fleet_arena.rank = pvp.rank || null;
+      if (tab === 3) {
+        response.grand_arena.rank = pvp.rank || null;
+        // League tier: comlink returns a numeric tier or a leagueName string
+        // Tier values (ascending): 1=Carbonite, 2=Bronzium, 3=Chromium, 4=Aurodium, 5=Kyber
+        var leagueTier = pvp.leagueId || pvp.league || pvp.leagueTier || null;
+        var divisionTier = pvp.divisionId || pvp.division || pvp.divisionTier || null;
+        response.grand_arena.league_tier = leagueTier;
+        response.grand_arena.division_tier = divisionTier;
+        // Also pass through raw pvp object for debugging
+        response.grand_arena._raw = pvp;
+      }
     });
+    console.log('[SWGoH] GA data:', JSON.stringify(response.grand_arena));
 
     // Extract currencies — try multiple possible field names
     var currencies = {};
@@ -717,7 +746,7 @@ app.get('/api/player/:code', async function(req, res) {
   }
 });
 
-// ===== CHAT ENDPOINT (Claude Sonnet 4.6 with web search) =====
+// ===== CHAT ENDPOINT — Streaming SSE (Claude Sonnet 4.6 with web search) =====
 app.post('/api/chat', async function(req, res) {
   try {
     var clientIp = req.ip || req.connection.remoteAddress || 'unknown';
@@ -741,7 +770,7 @@ app.post('/api/chat', async function(req, res) {
     message = sanitizeString(message, 2000);
     rosterSummary = sanitizeString(rosterSummary || "", 80000);
 
-    // Build system prompt (Claude takes system as a separate parameter)
+    // Build system prompt
     var systemPrompt = SYSTEM_PROMPT;
     if (rosterSummary) {
       systemPrompt += "\n\n=== PLAYER ROSTER DATA ===\n" + rosterSummary + "\n=== END ROSTER DATA ===";
@@ -775,11 +804,7 @@ app.post('/api/chat', async function(req, res) {
         content: [
           {
             type: "image",
-            source: {
-              type: "base64",
-              media_type: mimeType,
-              data: imageData.base64
-            }
+            source: { type: "base64", media_type: mimeType, data: imageData.base64 }
           },
           {
             type: "text",
@@ -794,8 +819,15 @@ app.post('/api/chat', async function(req, res) {
       });
     }
 
-    // Call Claude Sonnet 4.6 with web search tool
-    var response = await anthropic.messages.create({
+    // ── Streaming SSE response ──
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+    res.flushHeaders();
+
+    var fullReply = '';
+
+    var stream = await anthropic.messages.stream({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 2000,
       system: systemPrompt,
@@ -804,34 +836,46 @@ app.post('/api/chat', async function(req, res) {
         {
           type: "web_search_20250305",
           name: "web_search",
-          max_uses: 3  // limit searches per message to control costs
+          max_uses: 3
         }
       ]
     });
 
-    // Extract text from Claude's response (may contain multiple content blocks)
-    var reply = '';
-    (response.content || []).forEach(function(block) {
-      if (block.type === 'text') {
-        reply += block.text;
+    for await (var event of stream) {
+      // Text delta — stream to client immediately
+      if (event.type === 'content_block_delta' && event.delta && event.delta.type === 'text_delta') {
+        var chunk = event.delta.text;
+        fullReply += chunk;
+        // SSE format: "data: <json>\n\n"
+        res.write('data: ' + JSON.stringify({ type: 'delta', text: chunk }) + '\n\n');
       }
-    });
+      // Web search started — let client know to show indicator
+      if (event.type === 'content_block_start' && event.content_block && event.content_block.type === 'tool_use') {
+        res.write('data: ' + JSON.stringify({ type: 'searching' }) + '\n\n');
+      }
+    }
 
-    if (!reply) reply = 'No response generated.';
+    var finalMsg = await stream.finalMessage();
+    console.log('[Chat] Model:', finalMsg.model,
+      '| Input tokens:', finalMsg.usage?.input_tokens,
+      '| Output tokens:', finalMsg.usage?.output_tokens,
+      '| Web searches:', finalMsg.usage?.server_tool_use?.web_search_requests || 0);
 
-    console.log('[Chat] Model:', response.model, '| Input tokens:', response.usage?.input_tokens, '| Output tokens:', response.usage?.output_tokens, '| Web searches:', response.usage?.server_tool_use?.web_search_requests || 0);
-
-    res.json({ reply: reply });
+    // Send done event so client knows the stream is complete
+    res.write('data: ' + JSON.stringify({ type: 'done' }) + '\n\n');
+    res.end();
 
   } catch (err) {
     console.error('Chat error:', err.message);
-    if (err.status === 429) {
-      return res.status(429).json({ error: 'AI rate limit reached. Please wait a moment.' });
+    // If headers not yet sent, return JSON error; otherwise send SSE error event
+    if (!res.headersSent) {
+      if (err.status === 429) return res.status(429).json({ error: 'AI rate limit reached. Please wait a moment.' });
+      if (err.status === 401) return res.status(500).json({ error: 'Invalid API key. Check ANTHROPIC_API_KEY.' });
+      return res.status(500).json({ error: 'Internal server error' });
+    } else {
+      res.write('data: ' + JSON.stringify({ type: 'error', message: err.message || 'Internal server error' }) + '\n\n');
+      res.end();
     }
-    if (err.status === 401) {
-      return res.status(500).json({ error: 'Invalid API key. Check ANTHROPIC_API_KEY.' });
-    }
-    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -848,8 +892,24 @@ app.get('/health', function(req, res) {
   });
 });
 
+// ===== DEBUG AUTH MIDDLEWARE =====
+// Protect debug endpoints with a secret token from env var.
+// Access via: GET /debug-names?token=YOUR_DEBUG_TOKEN
+var DEBUG_TOKEN = process.env.DEBUG_TOKEN || '';
+
+function requireDebugToken(req, res, next) {
+  if (!DEBUG_TOKEN) {
+    return res.status(403).json({ error: 'Debug endpoints disabled. Set DEBUG_TOKEN env var to enable.' });
+  }
+  var provided = req.query.token || req.headers['x-debug-token'] || '';
+  if (provided !== DEBUG_TOKEN) {
+    return res.status(403).json({ error: 'Invalid debug token.' });
+  }
+  next();
+}
+
 // ===== DEBUG: Check name map samples =====
-app.get('/debug-names', function(req, res) {
+app.get('/debug-names', requireDebugToken, function(req, res) {
   var allNames = Object.keys(unitNameMap);
   var samples = {};
   // Show first 20 entries
@@ -873,7 +933,7 @@ app.get('/debug-names', function(req, res) {
 });
 
 // ===== DEBUG: Inspect raw skill structures to find omicron fields =====
-app.get('/debug-skills', async function(req, res) {
+app.get('/debug-skills', requireDebugToken, async function(req, res) {
   try {
     var metaRes = await fetch(COMLINK_URL + '/metadata', {
       method: 'POST',
@@ -963,7 +1023,7 @@ app.get('/debug-skills', async function(req, res) {
 });
 
 // ===== DEBUG: Probe comlink /data to find skill collection =====
-app.get('/debug-gamedata', async function(req, res) {
+app.get('/debug-gamedata', requireDebugToken, async function(req, res) {
   try {
     // Get metadata for version
     var metaRes = await fetch(COMLINK_URL + '/metadata', {
