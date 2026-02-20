@@ -210,7 +210,8 @@ async function loadSkillData() {
         payload: {
           version: gameVersion,
           includePveUnits: false,
-          requestSegment: 4
+          requestSegment: 0,
+          items: 'skill'
         },
         enums: false
       }),
@@ -221,13 +222,17 @@ async function loadSkillData() {
 
     // Step 3: Find the skill collection in the response
     // Game data returns multiple collections; "skill" contains ability definitions
-    var skills = gameData.skill || [];
+    var topKeys = Object.keys(gameData);
+    console.log('[SWGoH] Game data response keys (first 15):', topKeys.slice(0, 15).join(', '));
+    console.log('[SWGoH] Total keys:', topKeys.length);
+    
+    var skills = gameData.skill || gameData.skillList || [];
     if (skills.length === 0) {
-      // Try alternate key names
-      var possibleKeys = Object.keys(gameData).filter(function(k) {
+      // Try alternate key names — comlink may use different casing or suffixes
+      var possibleKeys = topKeys.filter(function(k) {
         return k.toLowerCase().indexOf('skill') >= 0;
       });
-      console.log('[SWGoH] Skill-like keys in game data:', possibleKeys.join(', '));
+      console.log('[SWGoH] Skill-like keys in game data:', possibleKeys.join(', ') || 'NONE');
       if (possibleKeys.length > 0) {
         skills = gameData[possibleKeys[0]] || [];
       }
@@ -235,11 +240,7 @@ async function loadSkillData() {
     console.log('[SWGoH] Found', skills.length, 'skill definitions in game data');
 
     if (skills.length === 0) {
-      // Log available top-level keys for debugging
-      var topKeys = Object.keys(gameData);
-      console.log('[SWGoH] Available game data collections:', topKeys.slice(0, 20).join(', '));
-      console.log('[SWGoH] Total collections:', topKeys.length);
-      throw new Error('No skill collection found in game data segment 4');
+      throw new Error('No skill collection found in game data (items=skill). Keys: ' + topKeys.slice(0, 10).join(', '));
     }
 
     // Step 4: Build the skill data map
