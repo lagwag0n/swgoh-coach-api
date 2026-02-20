@@ -178,6 +178,135 @@ async function loadUnitNames() {
 // Reload names every 24 hours (game updates add new units)
 setInterval(loadUnitNames, 24 * 60 * 60 * 1000);
 
+// ===== SKILL DATA MAP (loaded from comlink game data on startup) =====
+// Maps skillId → { isZeta, maxTier, omicronTier, omicronMode }
+// omicronTier = the tier at which the omicron activates (0 = no omicron)
+// omicronMode: 1=TW, 2=TB, 3=GAC, etc.
+var skillDataMap = {};
+var skillDataReady = false;
+
+async function loadSkillData() {
+  try {
+    console.log('[SWGoH] Loading skill data from comlink /data endpoint...');
+
+    // Step 1: Get metadata for latest game data version
+    var metaRes = await fetch(COMLINK_URL + '/metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: {} }),
+      signal: AbortSignal.timeout(15000)
+    });
+    if (!metaRes.ok) throw new Error('Metadata fetch failed: ' + metaRes.status);
+    var meta = await metaRes.json();
+    var gameVersion = meta.latestGamedataVersion;
+    if (!gameVersion) throw new Error('No game data version in metadata');
+    console.log('[SWGoH] Game data version:', gameVersion);
+
+    // Step 2: Fetch just the "skill" collection from game data
+    var dataRes = await fetch(COMLINK_URL + '/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payload: {
+          version: gameVersion,
+          includePveUnits: false,
+          requestSegment: 4
+        },
+        enums: false
+      }),
+      signal: AbortSignal.timeout(60000)
+    });
+    if (!dataRes.ok) throw new Error('Game data fetch failed: ' + dataRes.status);
+    var gameData = await dataRes.json();
+
+    // Step 3: Find the skill collection in the response
+    // Game data returns multiple collections; "skill" contains ability definitions
+    var skills = gameData.skill || [];
+    if (skills.length === 0) {
+      // Try alternate key names
+      var possibleKeys = Object.keys(gameData).filter(function(k) {
+        return k.toLowerCase().indexOf('skill') >= 0;
+      });
+      console.log('[SWGoH] Skill-like keys in game data:', possibleKeys.join(', '));
+      if (possibleKeys.length > 0) {
+        skills = gameData[possibleKeys[0]] || [];
+      }
+    }
+    console.log('[SWGoH] Found', skills.length, 'skill definitions in game data');
+
+    if (skills.length === 0) {
+      // Log available top-level keys for debugging
+      var topKeys = Object.keys(gameData);
+      console.log('[SWGoH] Available game data collections:', topKeys.slice(0, 20).join(', '));
+      console.log('[SWGoH] Total collections:', topKeys.length);
+      throw new Error('No skill collection found in game data segment 4');
+    }
+
+    // Step 4: Build the skill data map
+    var zetaCount = 0, omicronCount = 0;
+    skills.forEach(function(skill) {
+      var skillId = skill.id || '';
+      if (!skillId) return;
+
+      // Determine max tier from tierList or tier array
+      var tiers = skill.tierList || skill.tier || [];
+      var maxTier = tiers.length + 1; // +1 because base tier is tier 1
+      var isZeta = skill.isZeta || false;
+
+      // Scan tiers for omicronMode
+      // Each tier in the array may have an "omicronMode" field
+      var omicronTier = 0;
+      var omicronMode = 0;
+      tiers.forEach(function(t, idx) {
+        // Tier index 0 in array = tier 2 in-game (tier 1 is the base)
+        var tierNum = idx + 2;
+        if (t.omicronMode && t.omicronMode > 0) {
+          omicronTier = tierNum;
+          omicronMode = t.omicronMode;
+        }
+      });
+
+      // Also check for powerOverrideTags as indicator of special tiers
+      if (omicronTier === 0 && skill.powerOverrideTags && skill.powerOverrideTags.length > 0) {
+        // Skills with powerOverrideTags and maxTier >= 9 likely have omicrons
+        if (maxTier >= 9) {
+          omicronTier = maxTier; // assume omicron is at max tier
+        }
+      }
+
+      skillDataMap[skillId] = {
+        isZeta: isZeta,
+        maxTier: maxTier,
+        omicronTier: omicronTier,
+        omicronMode: omicronMode
+      };
+
+      if (isZeta) zetaCount++;
+      if (omicronTier > 0) omicronCount++;
+    });
+
+    skillDataReady = true;
+    console.log('[SWGoH] Skill data map built:', Object.keys(skillDataMap).length, 'skills');
+    console.log('[SWGoH] Skills with zeta:', zetaCount, '| Skills with omicron:', omicronCount);
+
+    // Log a few sample omicron skills for verification
+    var omicronSamples = Object.keys(skillDataMap).filter(function(k) {
+      return skillDataMap[k].omicronTier > 0;
+    }).slice(0, 5);
+    omicronSamples.forEach(function(k) {
+      var s = skillDataMap[k];
+      console.log('[SWGoH]   Omicron skill:', k, '→ maxTier:', s.maxTier, 'omicronTier:', s.omicronTier, 'mode:', s.omicronMode);
+    });
+
+  } catch (err) {
+    console.error('[SWGoH] Failed to load skill data:', err.message);
+    console.log('[SWGoH] Omicron detection will fall back to tier >= 9 heuristic');
+  }
+}
+
+// Reload skill data every 24 hours (game updates)
+setInterval(loadSkillData, 24 * 60 * 60 * 1000);
+
 // ===== SYSTEM PROMPT =====
 const SYSTEM_PROMPT = [
 "You are an expert coach and strategist for the game Star Wars Galaxy of Heroes.",
@@ -338,6 +467,21 @@ app.get('/api/player/:code', async function(req, res) {
           console.log('[SWGoH] Skill[0]:', JSON.stringify(unit.skill[0]).slice(0, 300));
           var highSkill = unit.skill.find(function(s) { return s.tier >= 7; });
           if (highSkill) console.log('[SWGoH] High-tier skill:', JSON.stringify(highSkill).slice(0, 300));
+          
+          // Show skill-to-gamedata matching for all high-tier skills
+          unit.skill.forEach(function(sk) {
+            if (sk.tier >= 7) {
+              var def = skillDataMap[sk.id];
+              if (def) {
+                console.log('[SWGoH]   Skill', sk.id, 'playerTier:', sk.tier, 
+                  'maxTier:', def.maxTier, 'isZeta:', def.isZeta, 
+                  'omicronTier:', def.omicronTier, 'omicronMode:', def.omicronMode,
+                  '→', (def.omicronTier > 0 && sk.tier >= def.omicronTier) ? 'OMICRON APPLIED' : 'no omicron');
+              } else {
+                console.log('[SWGoH]   Skill', sk.id, 'playerTier:', sk.tier, '→ NOT IN SKILL MAP');
+              }
+            }
+          });
         }
         if (unit.equippedStatMod && unit.equippedStatMod.length > 0) {
           console.log('[SWGoH] equippedStatMod[0]:', JSON.stringify(unit.equippedStatMod[0]).slice(0, 600));
@@ -361,13 +505,24 @@ app.get('/api/player/:code', async function(req, res) {
       var relicDisplay = relicRaw > 2 ? relicRaw - 2 : 0;
 
       // Count zetas and omicrons from skills
-      // Comlink skill structure: { id: <String>, tier: <Integer> }
-      // Zeta = skill at tier 8, Omicron = skill at tier 9
-      // A skill at tier 9 has BOTH zeta AND omicron applied
+      // Uses skill data map from game data when available, falls back to heuristic
       var zetas = 0, omicrons = 0;
+      var omicronDetails = []; // track which skills have omicrons for debugging
       (unit.skill || []).forEach(function(sk) {
-        if (sk.tier >= 8) zetas++;   // tier 8+ means zeta is applied
-        if (sk.tier >= 9) omicrons++; // tier 9 means omicron is also applied
+        var skillDef = skillDataMap[sk.id];
+        if (skillDef && skillDataReady) {
+          // Use game data: check if player tier meets zeta/omicron thresholds
+          if (skillDef.isZeta && sk.tier >= (skillDef.maxTier - 1)) zetas++;
+          else if (sk.tier >= 8) zetas++; // fallback for zeta if not flagged in data
+          if (skillDef.omicronTier > 0 && sk.tier >= skillDef.omicronTier) {
+            omicrons++;
+            omicronDetails.push(sk.id + ':T' + sk.tier + '/' + skillDef.omicronTier);
+          }
+        } else {
+          // Fallback heuristic when game data not available
+          if (sk.tier >= 8) zetas++;
+          if (sk.tier >= 9) omicrons++;
+        }
       });
 
       // Extract equipped mods
@@ -448,6 +603,14 @@ app.get('/api/player/:code', async function(req, res) {
       omicronTotal += (c.omicron_abilities || []).length;
     });
     console.log('[SWGoH] Characters with mods:', modCount, '| Total zetas:', zetaTotal, '| Total omicrons:', omicronTotal);
+    console.log('[SWGoH] Skill data map status:', skillDataReady ? 'LOADED (' + Object.keys(skillDataMap).length + ' skills)' : 'NOT LOADED (using fallback)');
+    
+    // Log characters that have omicrons for verification
+    characters.forEach(function(c) {
+      if (c.omicron_abilities && c.omicron_abilities.length > 0) {
+        console.log('[SWGoH]   Omicron character:', c.name, '→', c.omicron_abilities.length, 'omicron(s)');
+      }
+    });
 
     // Build response matching what the frontend expects
     var response = {
@@ -721,15 +884,19 @@ app.get('/debug-names', function(req, res) {
 // ===== START SERVER =====
 var PORT = process.env.PORT || 3000;
 
-loadUnitNames().then(function() {
+// Load both unit names and skill data in parallel on startup
+Promise.all([
+  loadUnitNames().catch(function(err) { 
+    console.error('Name map failed (non-fatal):', err.message); 
+  }),
+  loadSkillData().catch(function(err) { 
+    console.error('Skill data failed (non-fatal):', err.message); 
+  })
+]).then(function() {
   app.listen(PORT, function() {
     console.log('SWGoH Coach API running on port ' + PORT);
     console.log('Comlink URL:', COMLINK_URL);
     console.log('Name map loaded:', nameMapReady, '(' + Object.keys(unitNameMap).length + ' units)');
-  });
-}).catch(function(err) {
-  console.error('Startup warning — name map failed (non-fatal):', err.message);
-  app.listen(PORT, function() {
-    console.log('SWGoH Coach API running on port ' + PORT + ' (using fallback names)');
+    console.log('Skill data loaded:', skillDataReady, '(' + Object.keys(skillDataMap).length + ' skills)');
   });
 });
