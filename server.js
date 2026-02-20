@@ -314,7 +314,7 @@ const SYSTEM_PROMPT = [
 "",
 "WHAT YOU CAN SEE FOR EVERY CHARACTER:",
 "  - Gear level (G1–G13, G13 = full gear 13)",
-"  - Relic tier (R0–R10, shown only when > 0)",
+"  - Relic tier (R0–R9, shown only when > 0)",
 "  - Star level (1–7)",
 "  - Character level (1–85)",
 "  - Zeta count (number of zeta abilities applied)",
@@ -735,25 +735,49 @@ app.get('/api/player/:code', async function(req, res) {
     };
 
     // Extract arena ranks from pvpProfile if present
-    // tab 1 = Squad Arena, tab 2 = Fleet Arena, tab 3 = Grand Arena (GA)
-    response.grand_arena = { rank: null, league_tier: null, league_name: null };
+    // Dump ALL pvpProfile entries to console so we can see the exact structure
+    console.log('[SWGoH] pvpProfile raw:', JSON.stringify(raw.pvpProfile || []));
+
+    response.grand_arena = { rank: null, league_tier: null, division_tier: null };
     (raw.pvpProfile || []).forEach(function(pvp) {
       var tab = parseInt(pvp.tab) || 0;
+      console.log('[SWGoH] pvpProfile tab', tab, 'keys:', Object.keys(pvp).join(', '), '| full:', JSON.stringify(pvp));
+
       if (tab === 1) response.arena.rank = pvp.rank || null;
       if (tab === 2) response.fleet_arena.rank = pvp.rank || null;
       if (tab === 3) {
         response.grand_arena.rank = pvp.rank || null;
-        // League tier: comlink returns a numeric tier or a leagueName string
-        // Tier values (ascending): 1=Carbonite, 2=Bronzium, 3=Chromium, 4=Aurodium, 5=Kyber
-        var leagueTier = pvp.leagueId || pvp.league || pvp.leagueTier || null;
-        var divisionTier = pvp.divisionId || pvp.division || pvp.divisionTier || null;
-        response.grand_arena.league_tier = leagueTier;
-        response.grand_arena.division_tier = divisionTier;
-        // Also pass through raw pvp object for debugging
-        response.grand_arena._raw = pvp;
+        // Try every field name variant comlink might use for league/division
+        // Pass them ALL through so the frontend can find whichever one has data
+        response.grand_arena.league_tier    = pvp.leagueId       || pvp.league       || pvp.leagueTier    || pvp.divisionGroup || null;
+        response.grand_arena.division_tier  = pvp.divisionId     || pvp.division     || pvp.divisionTier  || null;
+        response.grand_arena.league_name    = pvp.leagueName     || pvp.league_name  || null;
+        response.grand_arena.division_name  = pvp.divisionName   || pvp.division_name || null;
+        // Pass entire raw pvp object so frontend can inspect any field
+        response.grand_arena._raw           = pvp;
       }
     });
-    console.log('[SWGoH] GA data:', JSON.stringify(response.grand_arena));
+
+    // Also check if GA data lives elsewhere in the raw response (some comlink versions)
+    if (!response.grand_arena.rank && raw.grandArena) {
+      var ga = raw.grandArena;
+      response.grand_arena.rank         = ga.rank       || null;
+      response.grand_arena.league_tier  = ga.leagueId   || ga.league    || null;
+      response.grand_arena.division_tier = ga.divisionId || ga.division  || null;
+      response.grand_arena._raw         = ga;
+      console.log('[SWGoH] GA found in raw.grandArena:', JSON.stringify(ga));
+    }
+    if (!response.grand_arena.rank && raw.playerRating) {
+      // Some versions nest it here
+      var pr = raw.playerRating;
+      response.grand_arena.rank         = pr.pvpRank?.rank || null;
+      response.grand_arena.league_tier  = pr.pvpRank?.leagueId || null;
+      response.grand_arena.division_tier = pr.pvpRank?.divisionId || null;
+      response.grand_arena._raw         = pr;
+      console.log('[SWGoH] GA found in raw.playerRating:', JSON.stringify(pr).slice(0, 400));
+    }
+
+    console.log('[SWGoH] Final GA data:', JSON.stringify(response.grand_arena));
 
     // Extract currencies — try multiple possible field names
     var currencies = {};
