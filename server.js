@@ -1044,7 +1044,24 @@ app.post('/api/chat', async function(req, res) {
 });
 
 // ===== HEALTH CHECK =====
-app.get('/health', function(req, res) {
+app.get('/rawunit', async function(req, res) {
+  try {
+    var r = await fetch('https://deploy-swgoh-comlink-production-daf7.up.railway.app/player', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({payload:{allyCode:'561325384'}, enums:false})
+    });
+    var d = await r.json();
+    var unit = (d.rosterUnit||[]).find(u=>(u.definitionId||'').includes('DARTHTRAYA'));
+    if (!unit) return res.json({error:'not found'});
+    res.json({
+      relic: unit.relic,
+      currentTier: unit.currentTier,
+      currentRarity: unit.currentRarity,
+      currentLevel: unit.currentLevel,
+      skills: unit.skill
+    });
+  } catch(e) { res.json({error:e.message}); }
+});app.get('/health', function(req, res) {
   res.json({
     status: 'ok',
     ai_model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
@@ -1055,7 +1072,6 @@ app.get('/health', function(req, res) {
     timestamp: new Date().toISOString()
   });
 });
-
 // ===== DEBUG AUTH MIDDLEWARE =====
 // Protect debug endpoints with a secret token from env var.
 // Access via: GET /debug-names?token=YOUR_DEBUG_TOKEN
