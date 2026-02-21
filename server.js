@@ -312,18 +312,23 @@ const SYSTEM_PROMPT = [
 "  Datacrons: DC#|Lv(level)|Set:ID|bonuses",
 "",
 "=== CRITICAL: HOW TO READ Z AND O VALUES ===",
-"Z = number of ZETA abilities the player has ALREADY APPLIED to this character.",
-"O = number of OMICRON abilities the player has ALREADY APPLIED to this character.",
-"If Z or O is missing from the line, it means ZERO — none have been applied.",
+"Z and O use the format APPLIED/TOTAL — e.g. Z2/3 means 2 zetas applied out of 3 available.",
+"O1/2 means 1 omicron applied out of 2 available.",
+"Z0/3 = no zetas applied yet, but 3 are available to unlock.",
+"O0/1 = no omicron applied yet, but 1 is available.",
+"If Z or O is absent entirely, that unit has no zeta or omicron abilities at all.",
 "",
-"LANGUAGE RULES (mandatory — violations will mislead the player):",
-"  WRONG: 'Your Bane has an omicron' — this claims they already applied it.",
-"  RIGHT:  'You should apply an omicron to Bane' — this is a recommendation.",
-"  WRONG: 'Darth Revan has a zeta on his leader ability'",
-"  RIGHT:  'Darth Revan has Z3, meaning 3 zetas applied. You should also consider...'",
+"Zetas and omicrons are INDEPENDENT — a single ability can have both.",
+"e.g. Darth Traya leader ability has a zeta AND an omicron — applying the omicron does NOT replace the zeta.",
 "",
-"NEVER state that a unit 'has' a zeta or omicron unless the roster data shows Z≥1 or O≥1 for that unit.",
-"ALWAYS distinguish clearly between what the player HAS DONE vs what you are RECOMMENDING they do next.",
+"LANGUAGE RULES (mandatory):",
+"  CORRECT: 'Darth Traya has Z2/3 — 2 zetas applied, 1 still available'",
+"  CORRECT: 'You should apply the remaining zeta on Traya'",
+"  CORRECT: 'Traya has O0/1 — her omicron is available but not yet applied'",
+"  WRONG:   'Traya has an omicron' — only say this if O applied ≥ 1",
+"  WRONG:   'Traya has all her zetas' — only say this if Z applied = Z total",
+"",
+"NEVER fabricate or assume upgrade status. Only state what the Z/O data shows.",
 "",
 "=== YOUR JOB ===",
 "- Advise on the strongest defensive and offensive teams in Grand Arena (3v3 and 5v5) based on the player's actual roster and current meta.",
@@ -595,21 +600,41 @@ app.get('/api/player/:code', async function(req, res) {
       var relicRaw = (unit.relic && unit.relic.currentTier) ? unit.relic.currentTier : 0;
       var relicDisplay = relicRaw > 2 ? relicRaw - 2 : 0;
 
-      // Count zetas and omicrons from skills
-      // IMPORTANT: comlink player skill.tier is the number of upgrades applied.
-      // In-game tier = sk.tier + 1 (tier 0 in comlink = in-game tier 1, the base).
-      // skillDataMap stores in-game tier thresholds (e.g. zetaTier:8 means in-game tier 8).
+      // Count zetas and omicrons from skills — INDEPENDENTLY.
+      // A single skill can have BOTH a zeta tier AND an omicron tier (they are different upgrades).
+      // e.g. Traya leader: zetaTier:8, omicronTier:9 — if player is at tier 9, counts as BOTH 1 zeta AND 1 omicron.
+      // We track the skill IDs so the AI can see exactly which abilities are upgraded.
       var zetas = 0, omicrons = 0;
+      var zetaSkills = [], omicronSkills = [];       // skill IDs that have been applied
+      var missingZetas = [], missingOmicrons = [];   // skill IDs available but not yet applied
+
       (unit.skill || []).forEach(function(sk) {
         var skillDef = skillDataMap[sk.id];
         var inGameTier = (sk.tier || 0) + 1;
+
         if (skillDef && skillDataReady) {
-          if (skillDef.zetaTier > 0 && inGameTier >= skillDef.zetaTier) zetas++;
-          if (skillDef.omicronTier > 0 && inGameTier >= skillDef.omicronTier) omicrons++;
+          // Zeta: check independently
+          if (skillDef.zetaTier > 0) {
+            if (inGameTier >= skillDef.zetaTier) {
+              zetas++;
+              zetaSkills.push(sk.id);
+            } else {
+              missingZetas.push(sk.id);
+            }
+          }
+          // Omicron: check independently (separate from zeta)
+          if (skillDef.omicronTier > 0) {
+            if (inGameTier >= skillDef.omicronTier) {
+              omicrons++;
+              omicronSkills.push(sk.id);
+            } else {
+              missingOmicrons.push(sk.id);
+            }
+          }
         } else {
-          // Fallback heuristic (in-game tier 8 = zeta, 9 = omicron)
-          if (inGameTier >= 8) zetas++;
-          if (inGameTier >= 9) omicrons++;
+          // Fallback heuristic when skill map unavailable
+          if (inGameTier >= 9) { omicrons++; omicronSkills.push(sk.id); }
+          else if (inGameTier >= 8) { zetas++; zetaSkills.push(sk.id); }
         }
       });
 
@@ -694,8 +719,12 @@ app.get('/api/player/:code', async function(req, res) {
         gear_level: combatType === 1 ? gear : 0,
         relic_tier: relicDisplay,
         power: 0,
-        zeta_abilities: new Array(zetas),
-        omicron_abilities: new Array(omicrons),
+        zeta_abilities:         new Array(zetas),
+        omicron_abilities:      new Array(omicrons),
+        zeta_skill_ids:         zetaSkills,
+        omicron_skill_ids:      omicronSkills,
+        missing_zeta_ids:       missingZetas,
+        missing_omicron_ids:    missingOmicrons,
         mods: combatType === 1 ? mods : [],
       };
 
@@ -713,7 +742,6 @@ app.get('/api/player/:code', async function(req, res) {
 
     console.log('[SWGoH] Parsed — Characters:', characters.length, 'Ships:', ships.length, 'GP:', gpTotal);
     
-    // Summary: count how many chars have mods/zetas/omicrons
     var modCount = 0, zetaTotal = 0, omicronTotal = 0;
     characters.forEach(function(c) {
       if (c.mods && c.mods.length > 0) modCount++;
@@ -722,11 +750,13 @@ app.get('/api/player/:code', async function(req, res) {
     });
     console.log('[SWGoH] Characters with mods:', modCount, '| Total zetas:', zetaTotal, '| Total omicrons:', omicronTotal);
     console.log('[SWGoH] Skill data map status:', skillDataReady ? 'LOADED (' + Object.keys(skillDataMap).length + ' skills)' : 'NOT LOADED (using fallback)');
-    
-    // Log characters that have omicrons for verification
+
+    // Log any characters that have zetas or omicrons for verification
     characters.forEach(function(c) {
-      if (c.omicron_abilities && c.omicron_abilities.length > 0) {
-        console.log('[SWGoH]   Omicron character:', c.name, '→', c.omicron_abilities.length, 'omicron(s)');
+      var z = (c.zeta_abilities || []).length;
+      var o = (c.omicron_abilities || []).length;
+      if (z > 0 || o > 0) {
+        console.log('[SWGoH]  ', c.name, '→ Z' + z + ' O' + o);
       }
     });
 
@@ -1108,6 +1138,103 @@ app.get('/debug-mods', requireDebugToken, async function(req, res) {
     }
 
     res.json(result);
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== DEBUG: Dump complete raw data for a specific unit =====
+// Usage: GET /debug-unit?token=TOKEN&code=561325384&unit=DARTHTRAYA
+// Returns: raw comlink fields, parsed values, skill map data, side-by-side comparison
+app.get('/debug-unit', requireDebugToken, async function(req, res) {
+  try {
+    var code = (req.query.code || '').replace(/[^0-9]/g, '');
+    var unitSearch = (req.query.unit || '').toUpperCase().trim();
+    if (!validateAllyCode(code)) return res.status(400).json({ error: 'Provide valid ?code=allycode' });
+    if (!unitSearch) return res.status(400).json({ error: 'Provide ?unit=BASEIDDORPARTOFNAME e.g. ?unit=DARTHTRAYA' });
+
+    var playerRes = await fetch(COMLINK_URL + '/player', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: { allyCode: code }, enums: false }),
+      signal: AbortSignal.timeout(20000)
+    });
+    if (!playerRes.ok) return res.status(502).json({ error: 'Comlink error: ' + playerRes.status });
+    var raw = await playerRes.json();
+
+    // Find the unit — match by baseId or partial name
+    var rosterUnits = raw.rosterUnit || raw.roster || [];
+    var matched = rosterUnits.filter(function(u) {
+      var bid = (u.definitionId || '').split(':')[0].toUpperCase();
+      var name = (getUnitName(u.definitionId) || '').toUpperCase();
+      return bid.indexOf(unitSearch) >= 0 || name.indexOf(unitSearch) >= 0;
+    });
+
+    if (matched.length === 0) {
+      // Return list of all unit IDs to help find the right name
+      var allIds = rosterUnits.map(function(u) {
+        return { id: (u.definitionId||'').split(':')[0], name: getUnitName(u.definitionId) };
+      });
+      return res.json({ error: 'Unit not found. Search: ' + unitSearch, available_units: allIds });
+    }
+
+    var unit = matched[0];
+    var baseId = (unit.definitionId || '').split(':')[0];
+
+    // ── Relic ──
+    var relicObj = unit.relic || {};
+    var relicRaw = relicObj.currentTier || 0;
+    var relicDisplay = relicRaw > 2 ? relicRaw - 2 : 0;
+
+    // ── Skills ──
+    var skillDump = (unit.skill || []).map(function(sk) {
+      var def = skillDataMap[sk.id];
+      var inGameTier = (sk.tier || 0) + 1;
+      return {
+        id: sk.id,
+        comlink_tier: sk.tier,
+        in_game_tier: inGameTier,
+        skill_map_entry: def || 'NOT IN MAP',
+        zeta_applied:    def && def.zetaTier > 0    ? inGameTier >= def.zetaTier    : null,
+        omicron_applied: def && def.omicronTier > 0 ? inGameTier >= def.omicronTier : null,
+      };
+    });
+
+    res.json({
+      unit_name:     getUnitName(unit.definitionId),
+      base_id:       baseId,
+      definition_id: unit.definitionId,
+
+      // Raw comlink fields
+      raw_fields: {
+        currentRarity:  unit.currentRarity,
+        currentLevel:   unit.currentLevel,
+        currentTier:    unit.currentTier,   // gear level
+        relic:          unit.relic,         // full relic object — shows currentTier
+        combatType:     unit.combatType,
+        skill_count:    (unit.skill || []).length,
+      },
+
+      // How we parse them
+      parsed: {
+        stars:         unit.currentRarity,
+        level:         unit.currentLevel,
+        gear_level:    unit.currentTier,
+        relic_raw:     relicRaw,
+        relic_display: relicDisplay,
+        relic_formula: 'relicRaw(' + relicRaw + ') - 2 = ' + relicDisplay,
+      },
+
+      // Full skill breakdown with map lookup
+      skills: skillDump,
+
+      // Summary
+      summary: {
+        zetas_applied:   skillDump.filter(function(s){ return s.zeta_applied === true; }).length,
+        zetas_available: skillDump.filter(function(s){ return s.zeta_applied === false; }).length,
+        omicrons_applied:   skillDump.filter(function(s){ return s.omicron_applied === true; }).length,
+        omicrons_available: skillDump.filter(function(s){ return s.omicron_applied === false; }).length,
+      }
+    });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
