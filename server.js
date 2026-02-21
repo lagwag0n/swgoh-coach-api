@@ -1053,15 +1053,43 @@ app.get('/rawunit', async function(req, res) {
     var d = await r.json();
     var unit = (d.rosterUnit||[]).find(u=>(u.definitionId||'').includes('DARTHTRAYA'));
     if (!unit) return res.json({error:'not found'});
+
+    // For each skill, show: comlink tier, calculated inGameTier, AND what the skillDataMap says
+    var skillBreakdown = (unit.skill||[]).map(function(sk) {
+      var def = skillDataMap[sk.id];
+      var inGame = sk.tier + 1;
+      return {
+        id: sk.id,
+        comlink_tier: sk.tier,
+        in_game_tier: inGame,
+        map_found: !!def,
+        map_zetaTier: def ? def.zetaTier : null,
+        map_omicronTier: def ? def.omicronTier : null,
+        map_maxTier: def ? def.maxTier : null,
+        zeta_applied: def && def.zetaTier > 0 ? inGame >= def.zetaTier : false,
+        omicron_applied: def && def.omicronTier > 0 ? inGame >= def.omicronTier : false,
+      };
+    });
+
     res.json({
-      relic: unit.relic,
-      currentTier: unit.currentTier,
-      currentRarity: unit.currentRarity,
-      currentLevel: unit.currentLevel,
-      skills: unit.skill
+      unit: 'Darth Traya',
+      relic_raw: (unit.relic||{}).currentTier,
+      relic_display: ((unit.relic||{}).currentTier||0) > 2 ? (unit.relic.currentTier - 2) : 0,
+      gear: unit.currentTier,
+      stars: unit.currentRarity,
+      level: unit.currentLevel,
+      skill_map_ready: skillDataReady,
+      skills: skillBreakdown,
+      totals: {
+        zetas_applied:    skillBreakdown.filter(function(s){return s.zeta_applied;}).length,
+        omicrons_applied: skillBreakdown.filter(function(s){return s.omicron_applied;}).length,
+        zetas_available:  skillBreakdown.filter(function(s){return s.map_zetaTier > 0 && !s.zeta_applied;}).length,
+        omicrons_available: skillBreakdown.filter(function(s){return s.map_omicronTier > 0 && !s.omicron_applied;}).length,
+      }
     });
   } catch(e) { res.json({error:e.message}); }
-});app.get('/health', function(req, res) {
+});
+app.get('/health', function(req, res) {
   res.json({
     status: 'ok',
     ai_model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
@@ -1072,6 +1100,7 @@ app.get('/rawunit', async function(req, res) {
     timestamp: new Date().toISOString()
   });
 });
+
 // ===== DEBUG AUTH MIDDLEWARE =====
 // Protect debug endpoints with a secret token from env var.
 // Access via: GET /debug-names?token=YOUR_DEBUG_TOKEN
